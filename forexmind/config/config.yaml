@@ -1,0 +1,126 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ForexMind — Master Trading Configuration
+# All runtime tunables live here so you never hard-code values in source files.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Trading Pairs ─────────────────────────────────────────────────────────────
+# OANDA instrument format: BASE_QUOTE  (e.g. EUR_USD, not EUR/USD)
+pairs:
+  # Majors
+  - EUR_USD
+  - GBP_USD
+  - USD_JPY
+  - USD_CHF
+  - USD_CAD
+  - AUD_USD
+  - NZD_USD
+  # Minors
+  - EUR_GBP
+  - EUR_JPY
+  - GBP_JPY
+  - AUD_JPY
+  - EUR_AUD
+  - GBP_CAD
+  - EUR_CAD
+  # Exotics (moderate liquidity)
+  - USD_MXN
+  - USD_SGD
+  - USD_HKD
+  - USD_ZAR
+
+# ── Timeframes ───────────────────────────────────────────────────────────────
+# Primary scalping timeframes + context timeframes
+timeframes:
+  primary: ["M1", "M5"]       # Scalping execution
+  context: ["M15", "H1"]      # Trend context for higher-timeframe alignment
+  swing: ["H4", "D"]          # Swing context (entry filter)
+
+# ── Indicator Settings ───────────────────────────────────────────────────────
+indicators:
+  ema_periods: [9, 21, 50, 200]
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  stoch_k: 14
+  stoch_d: 3
+  adx_period: 14
+  adx_trend_threshold: 25      # ADX > 25 means trending market
+  cci_period: 20
+  williams_r_period: 14
+  mfi_period: 14
+
+# ── Signal Scoring Weights ───────────────────────────────────────────────────
+# How much each strategy type contributes to the final ensemble score (must sum to 1.0)
+ensemble_weights:
+  rule_based: 0.30
+  lightgbm: 0.25
+  lstm: 0.25
+  rl_agent: 0.20
+
+# ── Risk Management Defaults ─────────────────────────────────────────────────
+risk:
+  max_risk_per_trade_pct: 2.0      # Maximum account % risked per trade
+  min_risk_per_trade_pct: 0.5      # Minimum (even tiny confidence gets some)
+  default_rr_ratio: 2.0            # Minimum reward:risk ratio
+  atr_stop_multiplier: 1.5         # Stop loss = entry ± (ATR × multiplier)
+  trailing_stop_multiplier: 1.0    # Trailing stop = current price ± (ATR × multiplier)
+  breakeven_trigger_rr: 1.0        # Move SL to breakeven after 1R profit
+  max_concurrent_trades: 5         # Across ALL pairs simultaneously
+  max_daily_loss_pct: 5.0          # Kill switch: stop trading if daily drawdown hits this
+  spread_filter_pips: 3.0          # Skip trade if spread > this value in pips
+
+# ── Session Times (UTC) ──────────────────────────────────────────────────────
+sessions:
+  sydney:  {open: "21:00", close: "06:00"}
+  tokyo:   {open: "00:00", close: "09:00"}
+  london:  {open: "07:00", close: "16:00"}
+  new_york: {open: "12:00", close: "21:00"}
+  # Overlap windows (highest volatility — prime scalping time)
+  london_ny_overlap: {start: "12:00", end: "16:00"}
+  tokyo_london_overlap: {start: "07:00", end: "09:00"}
+
+# ── Backtesting Defaults ─────────────────────────────────────────────────────
+backtest:
+  default_start: "2023-01-01"
+  default_end: "2024-12-31"
+  initial_capital: 10000.0         # USD
+  commission_per_lot: 7.0          # Round-trip commission in USD per standard lot
+  slippage_pips: 0.5               # Slippage simulation in pips
+  monte_carlo_runs: 1000           # For Monte Carlo stress testing
+
+# ── ML Model Settings ────────────────────────────────────────────────────────
+ml:
+  lookback_bars: 60                # How many candles of history per training sample
+  train_test_split: 0.8
+  cv_folds: 5
+  min_confidence_threshold: 0.55  # Minimum ML confidence to act on signal
+  retrain_interval_hours: 24      # Retrain models daily
+
+# ── News & Sentiment ─────────────────────────────────────────────────────────
+news:
+  fetch_interval_minutes: 15       # How often to poll for new articles
+  sentiment_window_hours: 4        # Rolling window for sentiment aggregation
+  high_impact_keywords:
+    - "interest rate"
+    - "federal reserve"
+    - "ECB"
+    - "inflation"
+    - "nonfarm payroll"
+    - "GDP"
+    - "unemployment"
+    - "central bank"
+    - "rate hike"
+    - "rate cut"
+  high_impact_events:              # Economic calendar impact filter
+    - "Non-Farm Employment Change"
+    - "Interest Rate Decision"
+    - "CPI"
+    - "GDP"
+    - "FOMC"
+    - "ECB Press Conference"

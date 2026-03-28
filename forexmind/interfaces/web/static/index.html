@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ForexMind AI Trading Dashboard</title>
+    <style>
+        :root {
+            --bg: #0d1117; --surface: #161b22; --border: #30363d;
+            --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
+            --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+            --purple: #bc8cff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+        header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
+        header h1 { font-size: 1.2rem; color: var(--blue); font-weight: 700; }
+        .badge { background: #1f6feb; color: white; font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; }
+        .session-bar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 8px 24px; font-size: 0.82rem; color: var(--muted); display: flex; gap: 16px; align-items: center; }
+        .session-pill { background: var(--border); padding: 2px 10px; border-radius: 10px; font-size: 0.75rem; }
+        .session-pill.active { background: #1a4b1a; color: var(--green); }
+        .overlap-badge { background: #3d1a00; color: var(--yellow); padding: 3px 10px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+        main { display: grid; grid-template-columns: 1fr 380px; flex: 1; overflow: hidden; gap: 0; }
+        .signals-panel { padding: 16px 20px; overflow-y: auto; }
+        .signals-panel h2 { font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+        .signal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+        .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; transition: border-color 0.2s; cursor: pointer; }
+        .signal-card:hover { border-color: var(--blue); }
+        .signal-card.buy { border-left: 3px solid var(--green); }
+        .signal-card.sell { border-left: 3px solid var(--red); }
+        .signal-card.hold { border-left: 3px solid var(--muted); }
+        .signal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .pair { font-size: 1rem; font-weight: 700; }
+        .action-badge { font-size: 0.75rem; font-weight: 700; padding: 3px 10px; border-radius: 4px; }
+        .action-badge.buy { background: #1a4b1a; color: var(--green); }
+        .action-badge.sell { background: #4b1a1a; color: var(--red); }
+        .action-badge.hold { background: var(--border); color: var(--muted); }
+        .signal-row { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px; }
+        .signal-item { font-size: 0.78rem; }
+        .signal-item .label { color: var(--muted); font-size: 0.7rem; }
+        .confidence-bar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 8px; }
+        .confidence-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+        .confidence-fill.buy { background: var(--green); }
+        .confidence-fill.sell { background: var(--red); }
+        /* Chat panel */
+        .chat-panel { border-left: 1px solid var(--border); display: flex; flex-direction: column; background: var(--surface); }
+        .chat-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 0.85rem; font-weight: 600; color: var(--blue); display: flex; align-items: center; gap: 8px; }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+        .msg { max-width: 95%; padding: 8px 12px; border-radius: 8px; font-size: 0.83rem; line-height: 1.5; }
+        .msg.user { background: #1f6feb22; border: 1px solid #1f6feb44; align-self: flex-end; }
+        .msg.agent { background: var(--bg); border: 1px solid var(--border); align-self: flex-start; }
+        .msg.agent pre { background: #0d1117; padding: 8px; border-radius: 4px; font-size: 0.78rem; overflow-x: auto; white-space: pre-wrap; }
+        .chat-input-row { padding: 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+        .chat-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 12px; font-size: 0.85rem; outline: none; }
+        .chat-input:focus { border-color: var(--blue); }
+        .chat-send { background: var(--blue); color: white; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: opacity 0.2s; }
+        .chat-send:hover { opacity: 0.85; }
+        .chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
+        .typing-indicator { color: var(--muted); font-size: 0.78rem; padding: 4px 12px; }
+        /* Quick actions */
+        .quick-actions { padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border); }
+        .qa-btn { background: var(--bg); border: 1px solid var(--border); color: var(--muted); border-radius: 12px; padding: 3px 10px; font-size: 0.75rem; cursor: pointer; transition: all 0.2s; }
+        .qa-btn:hover { border-color: var(--blue); color: var(--blue); }
+        /* Loading spinner */
+        .spinner { border: 2px solid var(--border); border-top: 2px solid var(--blue); border-radius: 50%; width: 14px; height: 14px; animation: spin 0.8s linear infinite; display: inline-block; margin-right: 6px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .error { color: var(--red); font-size: 0.8rem; }
+        .refresh-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 4px 10px; font-size: 0.75rem; cursor: pointer; margin-left: auto; }
+        .refresh-btn:hover { border-color: var(--blue); color: var(--blue); }
+    </style>
+</head>
+<body>
+<header>
+    <h1>📈 ForexMind</h1>
+    <span class="badge">AI Trading Agent</span>
+    <span id="clock" style="margin-left:auto;color:var(--muted);font-size:0.82rem;"></span>
+</header>
+<div class="session-bar" id="sessionBar">
+    <span style="color:var(--text);font-weight:600;">Market Sessions:</span>
+    <span id="sessionPills">Loading...</span>
+</div>
+<main>
+    <div class="signals-panel">
+        <div style="display:flex;align-items:center;margin-bottom:12px;">
+            <h2 style="margin:0">Live Signals</h2>
+            <button class="refresh-btn" onclick="refreshSignals()">⟳ Refresh</button>
+        </div>
+        <div class="signal-grid" id="signalGrid">
+            <div style="color:var(--muted);font-size:0.85rem;padding:20px;">Loading signals...</div>
+        </div>
+    </div>
+    <div class="chat-panel">
+        <div class="chat-header">
+            <span>💬</span> Chat with ForexMind
+            <span id="wsStatus" style="margin-left:auto;font-size:0.7rem;color:var(--green);">● Connected</span>
+        </div>
+        <div class="quick-actions">
+            <button class="qa-btn" onclick="quickChat('Should I buy EUR/USD?')">EUR/USD signal</button>
+            <button class="qa-btn" onclick="quickChat('What pairs should I trade now?')">Best pairs now</button>
+            <button class="qa-btn" onclick="quickChat('Show my account status')">Account</button>
+            <button class="qa-btn" onclick="quickChat('Is it a good time to trade?')">Market timing</button>
+        </div>
+        <div class="chat-messages" id="chatMessages">
+            <div class="msg agent">👋 Hello! I'm ForexMind — your AI trading analyst. Ask me anything about forex signals, strategies, or market conditions.</div>
+        </div>
+        <div class="typing-indicator" id="typingIndicator" style="display:none;"><span class="spinner"></span> Analysing...</div>
+        <div class="chat-input-row">
+            <input type="text" id="chatInput" class="chat-input" placeholder="Ask about any pair..." onkeydown="handleInputKey(event)" />
+            <button class="chat-send" id="sendBtn" onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+</main>
+
+<script>
+const API = '';
+let ws = null;
+let signalTimer = null;
+
+// ── Clock ──────────────────────────────────────────────────────────────────
+function updateClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent =
+        now.toUTCString().replace(' GMT', ' UTC');
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws/signals`);
+    ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'signal') updateSignalCard(msg.data);
+        if (msg.type === 'session') updateSessions(msg.data);
+    };
+    ws.onclose = () => {
+        document.getElementById('wsStatus').style.color = 'var(--red)';
+        document.getElementById('wsStatus').textContent = '● Reconnecting...';
+        setTimeout(connectWS, 5000);
+    };
+    ws.onopen = () => {
+        document.getElementById('wsStatus').style.color = 'var(--green)';
+        document.getElementById('wsStatus').textContent = '● Live';
+    };
+    setInterval(() => ws && ws.readyState === 1 && ws.send('ping'), 30000);
+}
+
+// ── Sessions ───────────────────────────────────────────────────────────────
+async function loadSessions() {
+    try {
+        const r = await fetch(`${API}/api/sessions`);
+        const d = await r.json();
+        updateSessions(d);
+    } catch(e) {}
+}
+
+function updateSessions(data) {
+    const sessions = ['Sydney', 'Tokyo', 'London', 'New York'];
+    let html = sessions.map(s =>
+        `<span class="session-pill ${data.active_sessions?.includes(s) ? 'active' : ''}">${s}</span>`
+    ).join('');
+    if (data.active_overlaps?.length) {
+        html += `<span class="overlap-badge">🔥 ${data.active_overlaps.join(', ')} Overlap</span>`;
+    }
+    document.getElementById('sessionPills').innerHTML = html;
+}
+
+// ── Signals ────────────────────────────────────────────────────────────────
+async function refreshSignals() {
+    document.getElementById('signalGrid').innerHTML =
+        '<div style="color:var(--muted);font-size:0.85rem;padding:20px;">Fetching signals...</div>';
+    try {
+        const r = await fetch(`${API}/api/signals`);
+        const d = await r.json();
+        renderSignals(d.signals || []);
+    } catch(e) {
+        document.getElementById('signalGrid').innerHTML =
+            `<div class="error">Error loading signals: ${e.message}</div>`;
+    }
+}
+
+function renderSignals(signals) {
+    const grid = document.getElementById('signalGrid');
+    if (!signals.length) {
+        grid.innerHTML = '<div style="color:var(--muted)">No signals available</div>';
+        return;
+    }
+    grid.innerHTML = signals.map(renderCard).join('');
+}
+
+function renderCard(s) {
+    if (s.error) return `<div class="signal-card"><div class="pair">${s.instrument}</div><div class="error">${s.error}</div></div>`;
+    const sig = s.signal || {};
+    const ind = s.indicators || {};
+    const action = (sig.action || 'HOLD').toLowerCase();
+    const conf = sig.confidence || 0;
+    const pair = (s.instrument || '').replace('_', '/');
+    return `
+    <div class="signal-card ${action}" onclick="quickChat('Give me full details on ${s.instrument}')">
+        <div class="signal-header">
+            <span class="pair">${pair}</span>
+            <span class="action-badge ${action}">${sig.action || 'HOLD'}</span>
+        </div>
+        <div class="signal-row">
+            <div class="signal-item"><div class="label">Entry</div>${sig.entry?.toFixed(5) || '-'}</div>
+            <div class="signal-item"><div class="label">Confidence</div>${conf}%</div>
+            <div class="signal-item"><div class="label">Stop Loss</div><span style="color:var(--red)">${sig.stop_loss?.toFixed(5) || '-'}</span></div>
+            <div class="signal-item"><div class="label">Take Profit</div><span style="color:var(--green)">${sig.take_profit?.toFixed(5) || '-'}</span></div>
+            <div class="signal-item"><div class="label">R:R</div>${sig.risk_reward || '-'}:1</div>
+            <div class="signal-item"><div class="label">RSI</div>${ind.rsi || '-'}</div>
+            <div class="signal-item"><div class="label">ADX</div>${ind.adx || '-'}</div>
+            <div class="signal-item"><div class="label">MACD</div>${ind.macd_cross || '-'}</div>
+        </div>
+        <div class="confidence-bar"><div class="confidence-fill ${action}" style="width:${Math.min(conf, 100)}%"></div></div>
+    </div>`;
+}
+
+function updateSignalCard(data) {
+    const pair = data.instrument;
+    const grid = document.getElementById('signalGrid');
+    const existing = grid.querySelector(`[data-pair="${pair}"]`);
+    const card = renderCard(data);
+    if (existing) existing.outerHTML = card;
+    else grid.insertAdjacentHTML('afterbegin', card);
+}
+
+// ── Chat ───────────────────────────────────────────────────────────────────
+function quickChat(msg) {
+    document.getElementById('chatInput').value = msg;
+    sendMessage();
+}
+
+function handleInputKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+async function sendMessage() {
+    const input = document.getElementById('chatInput');
+    const msg = input.value.trim();
+    if (!msg) return;
+    input.value = '';
+
+    appendMessage('user', msg);
+    const btn = document.getElementById('sendBtn');
+    btn.disabled = true;
+    document.getElementById('typingIndicator').style.display = 'flex';
+
+    try {
+        const r = await fetch(`${API}/api/chat`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: msg}),
+        });
+        const d = await r.json();
+        const signal = d.signal;
+        let responseText = d.response;
+        if (signal && signal.action !== 'HOLD') {
+            appendSignalSummary(signal);
+        }
+        appendMessage('agent', responseText);
+    } catch(e) {
+        appendMessage('agent', `⚠️ Error: ${e.message}`);
+    } finally {
+        btn.disabled = false;
+        document.getElementById('typingIndicator').style.display = 'none';
+    }
+}
+
+function appendMessage(role, text) {
+    const msgs = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = `msg ${role}`;
+    if (role === 'agent') {
+        div.innerHTML = text.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
+            .replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    } else {
+        div.textContent = text;
+    }
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+}
+
+function appendSignalSummary(sig) {
+    const action = sig.action;
+    const colour = action === 'BUY' ? 'var(--green)' : action === 'SELL' ? 'var(--red)' : 'var(--muted)';
+    const msgs = document.getElementById('chatMessages');
+    const div = document.createElement('div');
+    div.className = 'msg agent';
+    div.innerHTML = `
+        <div style="border:1px solid ${colour};border-radius:6px;padding:8px;margin-bottom:4px;">
+            <strong style="color:${colour}">${action} ${sig.instrument}</strong><br>
+            Entry: ${sig.entry} &nbsp;|&nbsp; SL: <span style="color:var(--red)">${sig.stop_loss}</span> &nbsp;|&nbsp; TP: <span style="color:var(--green)">${sig.take_profit}</span><br>
+            R:R ${sig.risk_reward}:1 &nbsp;|&nbsp; Confidence: ${sig.confidence}%
+        </div>`;
+    msgs.appendChild(div);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+loadSessions();
+refreshSignals();
+connectWS();
+setInterval(loadSessions, 60000);
+</script>
+</body>
+</html>

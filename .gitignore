@@ -1,0 +1,65 @@
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+mlenv/
+
+# ── ML Models (large binaries — train locally) ────────────────────────────────
+forexmind/models/*.pkl
+forexmind/models/*.pt
+forexmind/models/*.zip
+forexmind/models/*.bin
+!forexmind/models/.gitkeep
+
+# ── Database ──────────────────────────────────────────────────────────────────
+forexmind/data/*.db
+forexmind/data/*.sqlite
+forexmind/data/*.sqlite3
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Pytest / Coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Generated docs (optional — comment out to include in repo) ────────────────
+# docs/*.pdf
+# docs/*.pptx
