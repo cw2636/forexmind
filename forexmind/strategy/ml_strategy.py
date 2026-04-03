@@ -300,7 +300,7 @@ class LSTMStrategy(BaseStrategy):
 
     def _load(self, path: Path) -> None:
         try:
-            checkpoint = torch.load(path, map_location=DEVICE)
+            checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
             self._feature_cols = checkpoint["feature_cols"]
             self._scaler = checkpoint["scaler"]
             model = ForexLSTM(

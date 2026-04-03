@@ -63,3 +63,7 @@ Thumbs.db
 # ── Generated docs (optional — comment out to include in repo) ────────────────
 # docs/*.pdf
 # docs/*.pptx
+
+# SQLite database directory
+data/*.db
+data/*.sqlite

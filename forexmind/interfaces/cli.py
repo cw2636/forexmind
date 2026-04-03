@@ -261,7 +261,7 @@ async def _show_sessions() -> None:
         overlap_text = f"\n[bold green]🔥 OVERLAP: {', '.join(status.active_overlaps)} — Prime scalping time![/bold green]"
 
     console.print(Panel(
-        t.__rich_console__(console, console.options),  # type: ignore[arg-type]
+        t,
         title=f"[bold]Market Sessions — {now}[/bold]",
         subtitle=overlap_text,
     ))

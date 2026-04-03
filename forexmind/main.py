@@ -94,6 +94,15 @@ async def run_telegram_mode() -> None:
     await run_telegram_bot()
 
 
+# ── Scheduler mode ────────────────────────────────────────────────────────────
+
+async def run_scheduler_mode() -> None:
+    from forexmind.scheduler import run_scheduler
+    from forexmind.data.database import init_db
+    await init_db()
+    await run_scheduler()
+
+
 # ── All mode (web + telegram) ─────────────────────────────────────────────────
 
 async def run_all_mode() -> None:
@@ -172,11 +181,34 @@ async def train_models(pair: str) -> None:
         from datetime import datetime, timezone
 
         client = get_oanda_client()
-        console.print("[dim]Fetching 2 years of M5 data (this may take a moment)...[/dim]")
+        console.print("[dim]Fetching historical M5 data in weekly chunks...[/dim]")
 
-        start = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        # OANDA limits to 5000 candles per request.
+        # M5 candles: ~2016/week (Mon-Fri). Use 2-week windows to stay safe.
+        import pandas as pd
+        from datetime import timedelta
+
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
         end = datetime(2024, 12, 31, tzinfo=timezone.utc)
-        df = await client.get_candles(pair, "M5", from_dt=start, to_dt=end)
+        window = timedelta(weeks=2)
+
+        chunks = []
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + window, end)
+            console.print(f"[dim]  {cursor:%Y-%m-%d} → {chunk_end:%Y-%m-%d}[/dim]")
+            chunk = await client.get_candles(pair, "M5", from_dt=cursor, to_dt=chunk_end)
+            if not chunk.empty:
+                chunks.append(chunk)
+            cursor = chunk_end
+
+        if not chunks:
+            console.print("[red]No data returned. Check OANDA API key.[/red]")
+            return
+
+        df = pd.concat(chunks).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        console.print(f"[green]Fetched {len(df):,} bars total.[/green]")
 
         if df.empty:
             console.print("[red]No data returned. Check OANDA API key.[/red]")
@@ -218,6 +250,7 @@ Examples:
   python main.py web                    Start web dashboard (http://localhost:8000)
   python main.py telegram               Start Telegram bot
   python main.py all                    Start web + telegram simultaneously
+  python main.py scheduler              Auto-scan US session, push Telegram alerts
   python main.py signal EUR/USD         Quick one-shot signal
   python main.py backtest GBP/USD       Run 1-year backtest
   python main.py train EUR_USD          Train ML models
@@ -225,7 +258,7 @@ Examples:
     )
     parser.add_argument(
         "mode",
-        choices=["cli", "web", "telegram", "all", "signal", "backtest", "train"],
+        choices=["cli", "web", "telegram", "all", "scheduler", "signal", "backtest", "train"],
         help="Which interface to run",
     )
     parser.add_argument(
@@ -243,6 +276,7 @@ Examples:
         "web": lambda: asyncio.run(run_web_mode()),
         "telegram": lambda: asyncio.run(run_telegram_mode()),
         "all": lambda: asyncio.run(run_all_mode()),
+        "scheduler": lambda: asyncio.run(run_scheduler_mode()),
         "signal": lambda: asyncio.run(quick_signal(args.pair)),
         "backtest": lambda: asyncio.run(quick_backtest(args.pair)),
         "train": lambda: asyncio.run(train_models(args.pair)),
