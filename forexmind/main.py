@@ -178,6 +178,7 @@ async def train_models(pair: str) -> None:
         from forexmind.data.oanda_client import get_oanda_client
         from forexmind.indicators.engine import get_indicator_engine
         from forexmind.strategy.ml_strategy import LightGBMStrategy, LSTMStrategy
+        from forexmind.strategy.rl_strategy import RLStrategy
         from datetime import datetime, timezone
 
         client = get_oanda_client()
@@ -229,6 +230,15 @@ async def train_models(pair: str) -> None:
         lstm = LSTMStrategy()
         lstm_metrics = lstm.train(df_ind, epochs=30)
         console.print(f"[green]LSTM done. Accuracy: {lstm_metrics.get('accuracy', 0):.4f}[/green]")
+
+        # Train PPO RL Agent
+        console.print("[blue]Training PPO RL Agent (this takes the longest — ~500k timesteps)...[/blue]")
+        try:
+            rl = RLStrategy()
+            rl_metrics = rl.train(df_ind, instrument=pair, total_timesteps=200_000)
+            console.print(f"[green]PPO RL done. Timesteps: {rl_metrics.get('total_timesteps', 0):,}[/green]")
+        except ImportError as e:
+            console.print(f"[yellow]PPO RL skipped: {e}[/yellow]")
 
         console.print("[bold green]✓ Models trained and saved![/bold green]")
 

@@ -106,9 +106,12 @@ class ForexTradingEnv(gym.Env):
         self._steps: int = 0
 
     def _get_obs(self) -> np.ndarray:
-        """Return the flattened feature window."""
+        """Return the flattened feature window, sanitized for NaN/inf."""
         window_df = self._df[self._feature_cols].iloc[self._idx - self._window:self._idx]
-        return window_df.values.astype(np.float32).flatten()
+        obs = window_df.values.astype(np.float32).flatten()
+        # Replace NaN/inf with 0 to prevent logits from becoming invalid
+        obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
+        return np.clip(obs, -10.0, 10.0)
 
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
@@ -256,6 +259,7 @@ class RLStrategy(BaseStrategy):
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
+            device="cpu",   # MlpPolicy trains faster on CPU
             verbose=0,
         )
 

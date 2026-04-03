@@ -189,12 +189,24 @@ Models are trained locally and saved to `forexmind/models/` (gitignored):
 |---|---|---|
 | LightGBM | `lgbm_forex.pkl` | Fast, interpretable, 77%+ accuracy on M5 |
 | BiLSTM | `lstm_forex.pt` | Sequence model, improves with more data |
-| PPO-RL | `ppo_forex.zip` | Reinforcement learning (optional, `train` mode) |
+| PPO-RL | `ppo_forex.zip` | Reinforcement learning agent (trained via `train` command) |
 
-Retrain monthly:
+All three models are trained together with a single command:
 ```bash
 python forexmind/main.py train EUR_USD
 python forexmind/main.py train GBP_USD
+```
+
+The `train` command:
+1. Fetches 1 year of M5 candles from OANDA in 2-week chunks (respects 5000-candle API limit)
+2. Runs the indicator engine on all bars
+3. Trains **LightGBM** (fast, ~1 min)
+4. Trains **BiLSTM** (~5 min, 30 epochs)
+5. Trains **PPO RL Agent** (~10–15 min, 200k timesteps)
+
+Retrain monthly to keep models fresh:
+```bash
+python forexmind/main.py train EUR_USD
 ```
 
 ---
