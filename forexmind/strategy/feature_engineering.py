@@ -130,7 +130,7 @@ def add_normalised_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_target_label(df: pd.DataFrame, forward_bars: int = 1, threshold_pct: float = 0.02) -> pd.DataFrame:
+def add_target_label(df: pd.DataFrame, forward_bars: int = 12, threshold_pct: float = 0.05) -> pd.DataFrame:
     """
     Add a classification target: did price go UP, DOWN, or stay FLAT
     over the next `forward_bars` bars?
@@ -138,6 +138,8 @@ def add_target_label(df: pd.DataFrame, forward_bars: int = 1, threshold_pct: flo
     target: 1 = UP (bullish), -1 = DOWN (bearish), 0 = flat
     Used for training supervised ML models.
 
+    Defaults: 12 M5 bars = 1 hour ahead; 0.05% threshold ≈ 5 pips (EUR/USD).
+    These give a much cleaner signal than 1-bar-ahead on M5.
     threshold_pct: Minimum % move to count as directional (filters noise).
     """
     future_return = df["close"].shift(-forward_bars) / df["close"] - 1.0

@@ -239,12 +239,18 @@ class RLStrategy(BaseStrategy):
         if not (GYMNASIUM_AVAILABLE and SB3_AVAILABLE):
             raise ImportError("gymnasium and stable-baselines3 required for RL training")
 
-        feat_df = build_feature_matrix(df, add_target=False)
+        # Skip feature engineering if already pre-computed (multi-pair training path)
+        if any(c in df.columns for c in ("rsi", "macd", "adx")):
+            feat_df = df.replace([float("inf"), float("-inf")], float("nan")).dropna(
+                subset=["rsi", "macd", "adx"]
+            ).copy()
+        else:
+            feat_df = build_feature_matrix(df, add_target=False)
         self._feature_cols = get_feature_columns(feat_df)
         # Normalise features
         from sklearn.preprocessing import StandardScaler
         scaler = StandardScaler()
-        feat_df[self._feature_cols] = scaler.fit_transform(feat_df[self._feature_cols])
+        feat_df[self._feature_cols] = scaler.fit_transform(feat_df[self._feature_cols].values)
 
         env = DummyVecEnv([lambda: ForexTradingEnv(
             feat_df, self._feature_cols, window=self._window, instrument=instrument

@@ -181,61 +181,125 @@ async def train_models(pair: str) -> None:
         from forexmind.strategy.rl_strategy import RLStrategy
         from datetime import datetime, timezone
 
-        client = get_oanda_client()
-        console.print("[dim]Fetching historical M5 data in weekly chunks...[/dim]")
+        import logging as _logging
+        _logging.getLogger("oandapyV20").setLevel(_logging.WARNING)
 
-        # OANDA limits to 5000 candles per request.
-        # M5 candles: ~2016/week (Mon-Fri). Use 2-week windows to stay safe.
+        client = get_oanda_client()
+
+        # Strategy: train LightGBM + PPO on M5 (high-frequency, large dataset),
+        # train LSTM on H1 (hourly bars) — far cleaner signal, fewer bars needed.
+        # H1 with forward_bars=12 = 12 hours ahead (clear directional moves).
         import pandas as pd
         from datetime import timedelta
 
-        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-        end = datetime(2024, 12, 31, tzinfo=timezone.utc)
-        window = timedelta(weeks=2)
+        TRAIN_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY"]
+        start = datetime(2018, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2025, 12, 31, tzinfo=timezone.utc)
 
-        chunks = []
-        cursor = start
-        while cursor < end:
-            chunk_end = min(cursor + window, end)
-            console.print(f"[dim]  {cursor:%Y-%m-%d} → {chunk_end:%Y-%m-%d}[/dim]")
-            chunk = await client.get_candles(pair, "M5", from_dt=cursor, to_dt=chunk_end)
-            if not chunk.empty:
-                chunks.append(chunk)
-            cursor = chunk_end
+        console.print("[dim]Fetching M5 data (LightGBM + PPO) across 3 pairs from 2018...[/dim]")
+        m5_window = timedelta(weeks=2)
 
-        if not chunks:
-            console.print("[red]No data returned. Check OANDA API key.[/red]")
-            return
-
-        df = pd.concat(chunks).sort_index()
-        df = df[~df.index.duplicated(keep="last")]
-        console.print(f"[green]Fetched {len(df):,} bars total.[/green]")
-
-        if df.empty:
-            console.print("[red]No data returned. Check OANDA API key.[/red]")
-            return
-
+        # Fetch each pair and compute FULL feature matrices per-pair (with DatetimeIndex intact),
+        # then concatenate. This avoids timestamp deduplication and the 'int has no to_pydatetime' crash.
+        from forexmind.strategy.feature_engineering import build_feature_matrix
         engine = get_indicator_engine()
-        df_ind = engine.compute(df)
-        console.print(f"[green]Got {len(df_ind)} bars. Starting training...[/green]")
+        pair_feature_dfs: list[pd.DataFrame] = []  # M5 per-pair, for LightGBM + PPO
 
-        # Train LightGBM
-        console.print("[blue]Training LightGBM...[/blue]")
-        lgbm = LightGBMStrategy()
-        metrics = lgbm.train(df_ind)
-        console.print(f"[green]LightGBM done. Accuracy: {metrics.get('accuracy', 0):.4f}[/green]")
+        async def fetch_pair(pair: str, granularity: str, window: timedelta) -> pd.DataFrame:
+            """Fetch and deduplicate one pair's raw OHLCV data."""
+            cursor = start
+            chunks: list[pd.DataFrame] = []
+            err_count = 0
+            while cursor < end:
+                chunk_end = min(cursor + window, end)
+                try:
+                    chunk = await client.get_candles(pair, granularity, from_dt=cursor, to_dt=chunk_end)
+                    if not chunk.empty:
+                        chunks.append(chunk)
+                except Exception as e:
+                    err_count += 1
+                    if err_count <= 3:
+                        console.print(f"[yellow]  {pair}/{granularity} chunk {cursor.date()}: {e}[/yellow]")
+                cursor = chunk_end
+            if not chunks:
+                return pd.DataFrame()
+            raw = pd.concat(chunks).sort_index()
+            return raw[~raw.index.duplicated(keep="last")]
 
-        # Train LSTM
-        console.print("[blue]Training LSTM (may take a few minutes)...[/blue]")
+        # ── M5 fetch for LightGBM / PPO ───────────────────────────────────────
+        for train_pair in TRAIN_PAIRS:
+            console.print(f"[dim]  M5 {train_pair}...[/dim]")
+            raw = await fetch_pair(train_pair, "M5", m5_window)
+            if raw.empty:
+                console.print(f"[yellow]  {train_pair}: no M5 data, skipping.[/yellow]")
+                continue
+            pair_features = build_feature_matrix(engine.compute(raw), add_target=True)
+            console.print(f"[dim]    → {len(pair_features):,} M5 feature rows for {train_pair}[/dim]")
+            pair_feature_dfs.append(pair_features)
+
+        if not pair_feature_dfs:
+            console.print("[red]No M5 data returned. Check OANDA API key.[/red]")
+            return
+
+        df_ind = pd.concat(pair_feature_dfs, ignore_index=True)
+        console.print(f"[green]M5 combined: {len(df_ind):,} rows across {len(pair_feature_dfs)} pairs.[/green]")
+
+        # ── H1 fetch for LSTM ─────────────────────────────────────────────────
+        # H1 bars: 1 bar = 1 hour. forward_bars=12 → predict 12h ahead.
+        # ~7 years × 8760 H1 bars/year ≈ 61,000 bars per pair — fast to train.
+        # Signal-to-noise is far better than M5 for directional LSTM.
+        console.print("[dim]Fetching H1 data for LSTM (12h lookahead)...[/dim]")
+        h1_window = timedelta(weeks=26)   # 26-week chunks → fewer API calls on H1
+        h1_feature_dfs: list[pd.DataFrame] = []
+        for train_pair in TRAIN_PAIRS:
+            console.print(f"[dim]  H1 {train_pair}...[/dim]")
+            raw_h1 = await fetch_pair(train_pair, "H1", h1_window)
+            if raw_h1.empty:
+                console.print(f"[yellow]  {train_pair}: no H1 data, skipping.[/yellow]")
+                continue
+            pair_h1 = build_feature_matrix(engine.compute(raw_h1), add_target=True)
+            console.print(f"[dim]    → {len(pair_h1):,} H1 feature rows for {train_pair}[/dim]")
+            h1_feature_dfs.append(pair_h1)
+        console.print(f"[green]H1 combined: {sum(len(d) for d in h1_feature_dfs):,} rows across {len(h1_feature_dfs)} pairs.[/green]")
+
+        # Train LightGBM on M5 rows (skip if model < 24h old)
+        import time as _time
+        lgbm_path = get_settings().app.models_dir / "lgbm_forex.pkl"
+        lgbm_age_h = (_time.time() - lgbm_path.stat().st_mtime) / 3600 if lgbm_path.exists() else 999
+        if lgbm_age_h < 24:
+            console.print(f"[yellow]LightGBM skipped — model is only {lgbm_age_h:.1f}h old (< 24h threshold).[/yellow]")
+        else:
+            console.print("[blue]Training LightGBM on M5 dataset...[/blue]")
+            lgbm = LightGBMStrategy()
+            metrics = lgbm.train(df_ind)
+            console.print(f"[green]LightGBM done. Accuracy: {metrics.get('accuracy', 0):.4f}[/green]")
+
+        # Train LSTM per-pair on H1 data (12h lookahead, binary UP/DOWN classification)
+        use_lstm_data = h1_feature_dfs if h1_feature_dfs else pair_feature_dfs
+        lstm_label = "H1" if h1_feature_dfs else "M5"
+        console.print(f"[blue]Training LSTM on {lstm_label} per-pair (target 70% accuracy)...[/blue]")
         lstm = LSTMStrategy()
-        lstm_metrics = lstm.train(df_ind, epochs=30)
-        console.print(f"[green]LSTM done. Accuracy: {lstm_metrics.get('accuracy', 0):.4f}[/green]")
+        lstm_metrics: dict = {}
+        for pair_idx, pair_feat_df in enumerate(use_lstm_data):
+            pair_name = TRAIN_PAIRS[pair_idx]
+            console.print(f"[dim]  LSTM training on {pair_name} ({len(pair_feat_df):,} rows)...[/dim]")
+            warm = pair_idx > 0  # fine-tune from prev pair after first
+            pair_metrics = lstm.train(
+                pair_feat_df,
+                target_accuracy=0.70,
+                max_rows=500_000,   # H1 has ~61k rows/pair — no real cap needed
+                warm_start=warm,
+            )
+            console.print(f"[dim]    {pair_name} → accuracy: {pair_metrics.get('accuracy', 0):.4f}[/dim]")
+            if pair_metrics.get("accuracy", 0) > lstm_metrics.get("accuracy", 0):
+                lstm_metrics = pair_metrics
+        console.print(f"[green]LSTM done. Best accuracy: {lstm_metrics.get('accuracy', 0):.4f} | Params: {lstm_metrics.get('best_params', {})}[/green]")
 
-        # Train PPO RL Agent
-        console.print("[blue]Training PPO RL Agent (this takes the longest — ~500k timesteps)...[/blue]")
+        # Train PPO RL Agent on EUR_USD (single coherent time-series with DatetimeIndex)
+        console.print("[blue]Training PPO RL Agent (~200k timesteps)...[/blue]")
         try:
             rl = RLStrategy()
-            rl_metrics = rl.train(df_ind, instrument=pair, total_timesteps=200_000)
+            rl_metrics = rl.train(pair_feature_dfs[0], instrument=TRAIN_PAIRS[0], total_timesteps=200_000)
             console.print(f"[green]PPO RL done. Timesteps: {rl_metrics.get('total_timesteps', 0):,}[/green]")
         except ImportError as e:
             console.print(f"[yellow]PPO RL skipped: {e}[/yellow]")

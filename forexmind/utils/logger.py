@@ -61,7 +61,7 @@ def _setup_root_logger(level: str = "INFO") -> None:
     root.addHandler(handler)
 
     # Silence noisy third-party loggers
-    for noisy in ("urllib3", "asyncio", "httpx", "httpcore"):
+    for noisy in ("urllib3", "asyncio", "httpx", "httpcore", "oandapyV20", "requests"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
