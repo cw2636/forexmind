@@ -34,12 +34,16 @@ UTC = pytz.utc
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
 SCAN_INTERVAL_MINUTES = 15      # How often to scan in minutes
-MIN_CONFIDENCE = 65.0           # Minimum confidence % to fire alert
-AUTO_TRADE_CONFIDENCE = 80.0   # Confidence % at which trade is placed automatically
-MIN_RR = 1.5                    # Minimum risk:reward ratio
-COOLDOWN_MINUTES = 45           # Don't re-alert same pair within this window
-SESSION_START = time(7, 0)      # London session open (UTC) — covers London + US + both overlaps
-SESSION_END = time(21, 0)       # US session close (UTC)
+
+# Confidence thresholds (with RL weight cut to 0.05, 3 strategies agreeing at 70% = ~0.665):
+#   2 strategies agreeing → ~55–65%   (MODERATE — alert only)
+#   3 strategies agreeing → ~65–80%   (STRONG — tradeable)
+MIN_CONFIDENCE = 55.0           # Alert threshold raised — no more noise alerts
+AUTO_TRADE_CONFIDENCE = 65.0    # Auto-trade: 3 strong strategies agree
+MIN_RR = 2.0                    # 2:1 R:R minimum — standard professional threshold
+COOLDOWN_MINUTES = 90           # H1 candles close every hour — 90min prevents double-alert
+SESSION_START = time(7, 0)      # London open (UTC)
+SESSION_END = time(21, 0)       # US close (UTC)
 
 
 class AlertRecord(NamedTuple):
@@ -292,12 +296,69 @@ async def _scan_pairs(bot, chat_id: str, recent_alerts: dict[str, AlertRecord]) 
         await asyncio.sleep(1)
 
 
+# Hour (UTC) at which daily auto-retrain runs — 05:00 UTC (before London open)
+RETRAIN_HOUR_UTC = 5
+
+
+async def _run_daily_retrain(bot, chat_id: str) -> None:
+    """
+    Retrain LightGBM and LSTM models on fresh data.
+    Runs in a thread executor to avoid blocking the event loop.
+    Reports results to Telegram.
+    """
+    import concurrent.futures
+
+    log.info("Starting daily auto-retrain...")
+    await _send_telegram(bot, chat_id, "🔄 <b>Daily retrain started</b> — training LightGBM &amp; LSTM on latest data...")
+
+    loop = asyncio.get_event_loop()
+
+    def _retrain() -> dict:
+        results: dict[str, str] = {}
+        try:
+            from forexmind.strategy.ml_strategy import LightGBMStrategy, LSTMStrategy
+
+            lgbm = LightGBMStrategy()
+            lgbm_result = lgbm.train()
+            cv_acc = lgbm_result.get("cv_mean_accuracy", 0)
+            ho_acc = lgbm_result.get("holdout_accuracy", 0)
+            results["lightgbm"] = f"CV={cv_acc:.1%} | Holdout={ho_acc:.1%}"
+        except Exception as e:
+            results["lightgbm"] = f"FAILED: {e}"
+            log.error(f"LightGBM retrain error: {e}")
+
+        try:
+            from forexmind.strategy.ml_strategy import LSTMStrategy
+
+            lstm = LSTMStrategy()
+            lstm_result = lstm.train()
+            val_acc = lstm_result.get("best_val_accuracy", lstm_result.get("val_accuracy", 0))
+            results["lstm"] = f"Val={val_acc:.1%}"
+        except Exception as e:
+            results["lstm"] = f"FAILED: {e}"
+            log.error(f"LSTM retrain error: {e}")
+
+        return results
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        results = await loop.run_in_executor(pool, _retrain)
+
+    lines = ["✅ <b>Daily retrain complete</b>"]
+    for name, summary in results.items():
+        icon = "✅" if "FAILED" not in summary else "❌"
+        lines.append(f"{icon} <b>{name.upper()}</b>: {summary}")
+
+    await _send_telegram(bot, chat_id, "\n".join(lines))
+    log.info(f"Daily retrain done: {results}")
+
+
 async def run_scheduler() -> None:
     """
     Main scheduler loop.
 
     - Outside US session: sleeps and checks every minute until session opens
     - Inside US session: scans all pairs every SCAN_INTERVAL_MINUTES
+    - Daily retrain at RETRAIN_HOUR_UTC (05:00 UTC) before London open
     - Sends a wake-up and sleep message to Telegram
     """
     from telegram import Bot
@@ -311,21 +372,41 @@ async def run_scheduler() -> None:
     chat_id = cfg.telegram.chat_id
 
     log.info("ForexMind Scheduler starting...")
-    await _send_telegram(
-        bot, chat_id,
-        "🤖 <b>ForexMind Scheduler started</b>\n"
-        f"Scanning every {SCAN_INTERVAL_MINUTES} min during London + US sessions (07:00–21:00 UTC)\n\n"
-        f"📢 Alert only:  {MIN_CONFIDENCE}%–{AUTO_TRADE_CONFIDENCE - 1}% confidence\n"
-        f"⚡ Auto-trade:  ≥{AUTO_TRADE_CONFIDENCE}% confidence + {MIN_RR}:1 R:R\n\n"
-        f"<i>Paper trading mode — no real money at risk</i>"
-    )
+
+    # Only notify on startup if markets are open — no weekend pings
+    _startup_status = get_session_status(datetime.now(UTC))
+    if not _startup_status.is_weekend:
+        await _send_telegram(
+            bot, chat_id,
+            "🤖 <b>ForexMind Scheduler started</b>\n"
+            f"Scanning every {SCAN_INTERVAL_MINUTES} min during London + US sessions (07:00–21:00 UTC)\n\n"
+            f"📢 Alert only:  {MIN_CONFIDENCE}%–{AUTO_TRADE_CONFIDENCE - 1}% confidence\n"
+            f"⚡ Auto-trade:  ≥{AUTO_TRADE_CONFIDENCE}% confidence + {MIN_RR}:1 R:R\n\n"
+            f"🔄 Daily retrain: {RETRAIN_HOUR_UTC:02d}:00 UTC\n\n"
+            f"<i>Paper trading mode — no real money at risk</i>"
+        )
+    else:
+        log.info("Weekend — startup Telegram notification suppressed")
 
     recent_alerts: dict[str, AlertRecord] = {}
     session_open_announced = False
+    last_retrain_date: datetime | None = None
 
     while True:
         now = datetime.now(UTC)
         status = get_session_status(now)
+
+        # ── Daily retrain check ───────────────────────────────────────────────
+        # Fire once per day at RETRAIN_HOUR_UTC, before London open
+        today = now.date()
+        if (
+            now.hour == RETRAIN_HOUR_UTC
+            and (last_retrain_date is None or last_retrain_date < today)
+            and not status.is_weekend
+        ):
+            last_retrain_date = today
+            # Run in background — don't block the scheduler loop
+            asyncio.create_task(_run_daily_retrain(bot, chat_id))
 
         if status.is_weekend:
             log.info("Weekend — markets closed, sleeping 1 hour")
