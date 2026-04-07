@@ -51,15 +51,17 @@ class IndicatorSnapshot(TypedDict):
     ema_21: float
     ema_50: float
     ema_200: float
-    ema_trend: str        # "bullish" | "bearish" | "choppy"
+    ema_trend: str        # "bullish" | "weak_bullish" | "bearish" | "weak_bearish" | "choppy"
     macd: float
     macd_signal: float
     macd_hist: float
     macd_cross: str       # "bull_cross" | "bear_cross" | "none"
     adx: float
     adx_trend_strength: str  # "trending" | "ranging"
+    dmp: float             # +DI (bullish directional strength)
+    dmn: float             # -DI (bearish directional strength)
     psar: float
-    psar_signal: str      # "bullish" | "bearish"
+    psar_signal: str      # "bullish" | "bearish" | "neutral"
 
     # Momentum
     rsi: float
@@ -170,23 +172,36 @@ class IndicatorEngine:
             signal=self.cfg.macd_signal,
         )
         if macd is not None:
-            df["macd"] = macd.iloc[:, 0]
-            df["macd_hist"] = macd.iloc[:, 1]
-            df["macd_signal"] = macd.iloc[:, 2]
+            # Use column name prefix search — avoids fragile integer indexing
+            # pandas-ta returns: MACD_{f}_{s}_{sig}, MACDh_{f}_{s}_{sig}, MACDs_{f}_{s}_{sig}
+            macd_col  = next((c for c in macd.columns if c.startswith("MACD_")), None)
+            macdh_col = next((c for c in macd.columns if c.startswith("MACDh_")), None)
+            macds_col = next((c for c in macd.columns if c.startswith("MACDs_")), None)
+            if macd_col:  df["macd"]        = macd[macd_col]
+            if macdh_col: df["macd_hist"]   = macd[macdh_col]
+            if macds_col: df["macd_signal"] = macd[macds_col]
 
         # ── ADX ───────────────────────────────────────────────────────────────
         adx = ta.adx(df["high"], df["low"], df["close"], length=self.cfg.adx_period)
         if adx is not None:
-            df["adx"] = adx.iloc[:, 0]       # ADX value
-            df["dmp"] = adx.iloc[:, 1]       # +DI
-            df["dmn"] = adx.iloc[:, 2]       # -DI
+            # pandas-ta returns: ADX_{n}, DMP_{n} (+DI), DMN_{n} (-DI)
+            adx_col = next((c for c in adx.columns if c.startswith("ADX_")), None)
+            dmp_col = next((c for c in adx.columns if c.startswith("DMP_")), None)
+            dmn_col = next((c for c in adx.columns if c.startswith("DMN_")), None)
+            if adx_col: df["adx"] = adx[adx_col]
+            if dmp_col: df["dmp"] = adx[dmp_col]   # +DI: bullish directional strength
+            if dmn_col: df["dmn"] = adx[dmn_col]   # -DI: bearish directional strength
 
         # ── Parabolic SAR ─────────────────────────────────────────────────────
         psar = ta.psar(df["high"], df["low"], df["close"])
         if psar is not None:
-            # pandas-ta returns PSARl (long) and PSARs (short) — use whichever is active
-            df["psar_long"] = psar.get(psar.columns[0], pd.Series(dtype=float))
-            df["psar_short"] = psar.get(psar.columns[1], pd.Series(dtype=float))
+            # pandas-ta returns: PSARl_{step}_{max} (long/bullish dots below price)
+            #                    PSARs_{step}_{max} (short/bearish dots above price)
+            # Exactly one is non-NaN per bar — whichever SAR is active.
+            psar_long_col  = next((c for c in psar.columns if "PSARl" in c), None)
+            psar_short_col = next((c for c in psar.columns if "PSARs" in c), None)
+            if psar_long_col:  df["psar_long"]  = psar[psar_long_col]
+            if psar_short_col: df["psar_short"] = psar[psar_short_col]
             df["psar"] = df["psar_long"].fillna(df["psar_short"])
 
         # ── RSI ───────────────────────────────────────────────────────────────
@@ -255,11 +270,11 @@ class IndicatorEngine:
 
     def _add_swing_levels(self, df: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
         """
-        Mark swing highs and lows: a bar is a swing high if its high
-        is the highest of the surrounding `lookback` bars.
+        Mark swing highs and lows using only past bars (no center=True look-ahead).
+        A bar is a swing high if its high was the highest of the previous `lookback` bars.
         """
-        rolling_high = df["high"].rolling(lookback, center=True).max()
-        rolling_low = df["low"].rolling(lookback, center=True).min()
+        rolling_high = df["high"].rolling(lookback, center=False).max()
+        rolling_low = df["low"].rolling(lookback, center=False).min()
         df["swing_high"] = np.where(df["high"] == rolling_high, df["high"], np.nan)
         df["swing_low"] = np.where(df["low"] == rolling_low, df["low"], np.nan)
         return df
@@ -291,11 +306,20 @@ class IndicatorEngine:
         ema_50 = _f("ema_50")
         ema_200 = _f("ema_200")
 
-        # EMA trend alignment: all stacked bullishly or bearishly
+        # EMA trend alignment: full stack or partial (weak) alignment
+        # bullish      — 9 > 21 > 50: all three fully aligned up
+        # weak_bullish — 9 > 21, but 21 < 50: short-term bullish, trend turning
+        # bearish      — 9 < 21 < 50: all three fully aligned down
+        # weak_bearish — 9 < 21, but 21 > 50: short-term bearish, trend turning
+        # choppy       — no clear short-term alignment
         if ema_9 > ema_21 > ema_50:
             ema_trend = "bullish"
         elif ema_9 < ema_21 < ema_50:
             ema_trend = "bearish"
+        elif ema_9 > ema_21:
+            ema_trend = "weak_bullish"
+        elif ema_9 < ema_21:
+            ema_trend = "weak_bearish"
         else:
             ema_trend = "choppy"
 
@@ -311,13 +335,20 @@ class IndicatorEngine:
         else:
             macd_cross = "none"
 
-        # ADX trend strength
+        # ADX trend strength + directional movement
         adx_val = _f("adx")
         adx_trend_strength = "trending" if adx_val > self.cfg.adx_trend_threshold else "ranging"
+        dmp_val = _f("dmp")   # +DI
+        dmn_val = _f("dmn")   # -DI
 
-        # Parabolic SAR direction
-        psar_val = _f("psar")
-        psar_signal = "bullish" if close > psar_val else "bearish"
+        # Parabolic SAR direction — only valid when psar is non-zero (NaN was replaced with 0 by _f)
+        psar_raw = row.get("psar", None)
+        if pd.notna(psar_raw) and float(psar_raw) != 0.0:
+            psar_val = float(psar_raw)
+            psar_signal = "bullish" if close > psar_val else "bearish"
+        else:
+            psar_val = 0.0
+            psar_signal = "neutral"  # No active SAR — don't influence direction
 
         # RSI zone
         rsi_val = _f("rsi")
@@ -362,6 +393,7 @@ class IndicatorEngine:
             macd=macd_val, macd_signal=_f("macd_signal"), macd_hist=_f("macd_hist"),
             macd_cross=macd_cross,
             adx=adx_val, adx_trend_strength=adx_trend_strength,
+            dmp=dmp_val, dmn=dmn_val,
             psar=psar_val, psar_signal=psar_signal,
             rsi=rsi_val, rsi_zone=rsi_zone,
             stoch_k=sk, stoch_d=sd, stoch_cross=stoch_cross,
@@ -382,7 +414,7 @@ def _empty_snapshot(instrument: str, timeframe: str) -> IndicatorSnapshot:
         instrument=instrument, timeframe=timeframe, timestamp="",
         ema_9=0, ema_21=0, ema_50=0, ema_200=0, ema_trend="choppy",
         macd=0, macd_signal=0, macd_hist=0, macd_cross="none",
-        adx=0, adx_trend_strength="ranging",
+        adx=0, adx_trend_strength="ranging", dmp=0, dmn=0,
         psar=0, psar_signal="neutral",
         rsi=50, rsi_zone="neutral",
         stoch_k=50, stoch_d=50, stoch_cross="none",

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from forexmind.indicators.engine import IndicatorSnapshot
 from forexmind.utils.logger import get_logger
+from forexmind.config.settings import get_settings
 
 log = get_logger(__name__)
 
@@ -52,20 +53,55 @@ class SignalScore:
     reasoning: str            # Human-readable explanation for Claude
 
 
-def score_snapshot(snap: IndicatorSnapshot) -> SignalScore:
+def score_snapshot(snap: IndicatorSnapshot, session_score: float | None = None) -> SignalScore:
     """
     Compute composite signal score from an IndicatorSnapshot.
 
     Returns a SignalScore with direction and confidence.
+
+    Hard gates (force HOLD regardless of indicator votes):
+      - ADX below minimum threshold (config: indicators.adx_trend_threshold, default 25):
+        market is ranging/choppy — scalpers consistently lose here.
+        Gate is set at 60% of the trend threshold to allow borderline trending markets.
+      - ATR near zero: no volatility, probably off-hours or data gap
     """
+    cfg = get_settings()
+    adx_trend_threshold = cfg.indicator_config.get("adx_trend_threshold", 25)
+    # Hard gate at 60% of the trend threshold (e.g. 15 when threshold=25).
+    # Allows borderline-trending markets (ADX 15-25) to pass and get voted on,
+    # instead of being hard-rejected at 20 regardless of all other indicators.
+    adx_gate = adx_trend_threshold * 0.60
+
+    # ── Hard gates — check before any voting ─────────────────────────────────
+    adx_val = snap["adx"]
+    if adx_val < adx_gate:
+        return SignalScore(
+            composite=0.0, direction="HOLD", confidence=0.0,
+            trend_vote=0.0, momentum_vote=0.0, structure_vote=0.0,
+            volatility_vote=0.0, volume_vote=0.0,
+            reasoning=f"HOLD — ADX={adx_val:.1f} < {adx_gate:.0f}: ranging market, no directional edge",
+        )
+
+    if snap["atr"] == 0.0 or snap["atr_pct"] < 0.01:
+        return SignalScore(
+            composite=0.0, direction="HOLD", confidence=0.0,
+            trend_vote=0.0, momentum_vote=0.0, structure_vote=0.0,
+            volatility_vote=0.0, volume_vote=0.0,
+            reasoning="HOLD — ATR near zero: insufficient volatility or data gap",
+        )
+
     # ── Trend Group ───────────────────────────────────────────────────────────
     trend_votes: list[float] = []
 
-    # EMA stack alignment
+    # EMA stack alignment — full alignment scores ±1.0, partial (weak) ±0.5
     if snap["ema_trend"] == "bullish":
         trend_votes.append(1.0)
+    elif snap["ema_trend"] == "weak_bullish":
+        trend_votes.append(0.5)    # Short-term bullish but 50 EMA not yet crossed
     elif snap["ema_trend"] == "bearish":
         trend_votes.append(-1.0)
+    elif snap["ema_trend"] == "weak_bearish":
+        trend_votes.append(-0.5)   # Short-term bearish but 50 EMA not yet crossed
     else:
         trend_votes.append(0.0)
 
@@ -92,8 +128,16 @@ def score_snapshot(snap: IndicatorSnapshot) -> SignalScore:
     else:
         trend_votes.append(0.0)
 
-    # ADX filters: only give trend votes weight if market is actually trending
-    adx_multiplier = min(snap["adx"] / 25.0, 1.5) if snap["adx"] > 20 else 0.5
+    # ADX directional index: +DI > -DI = bullish trend, +DI < -DI = bearish trend.
+    # This confirms WHICH direction the trend is moving, not just that it IS trending.
+    dmp = snap.get("dmp", 0.0)
+    dmn = snap.get("dmn", 0.0)
+    if dmp > 0 and dmn > 0:
+        di_spread = (dmp - dmn) / max(dmp + dmn, 1.0)  # Normalized -1 to +1
+        trend_votes.append(di_spread * 0.7)             # Weighted DI confirmation
+
+    # ADX strength multiplier: scale votes up as ADX rises above threshold
+    adx_multiplier = min(snap["adx"] / adx_trend_threshold, 1.5) if snap["adx"] >= adx_gate else 0.5
     trend_vote = _avg(trend_votes) * adx_multiplier
 
     # ── Momentum Group ────────────────────────────────────────────────────────
@@ -211,6 +255,19 @@ def score_snapshot(snap: IndicatorSnapshot) -> SignalScore:
         + volume_vote   * WEIGHTS["volume"]
     )
     composite = round(raw * 100, 2)                    # Scale to [-100, +100]
+
+    # ── Session quality bonus ─────────────────────────────────────────────────
+    # London-NY overlap (session_score ≈ 0.8-1.0) produces the highest liquidity and
+    # largest directional moves. Amplify the composite score by up to +15% during
+    # prime sessions — signals taken during high-liquidity windows are historically
+    # more reliable for scalping.
+    if session_score is not None and abs(composite) > 5.0:
+        # Boost: +0% at session_score=0.5, +15% at session_score=1.0
+        # No boost or reduction below 0.5 (keep off-hours signals unchanged)
+        if session_score > 0.5:
+            session_boost = 1.0 + (session_score - 0.5) * 0.30  # max +15%
+            composite = composite * session_boost
+
     composite = max(-100.0, min(100.0, composite))
 
     # ── Direction and Confidence ──────────────────────────────────────────────
