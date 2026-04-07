@@ -26,7 +26,13 @@ from dotenv import load_dotenv
 # Project root: forexmind/config/settings.py → forexmind/ → /home/wilson/Forex/
 ROOT_DIR = Path(__file__).resolve().parent.parent        # .../forexmind/
 PROJECT_DIR = ROOT_DIR.parent                            # .../Forex/
-ENV_FILE = PROJECT_DIR / ".env"
+
+# System paths used when installed as a .deb package
+SYSTEM_CONFIG = Path("/etc/forexmind")
+SYSTEM_DATA = Path("/var/lib/forexmind")
+
+# Prefer /etc/forexmind/.env (installed package) over project-root .env (dev)
+ENV_FILE = SYSTEM_CONFIG / ".env" if SYSTEM_CONFIG.exists() else PROJECT_DIR / ".env"
 
 # Load .env at module import time — safe to call multiple times
 load_dotenv(ENV_FILE, override=False)
@@ -89,7 +95,9 @@ class DataConfig:
     database_url: str = field(
         default_factory=lambda: os.environ.get(
             "DATABASE_URL",
-            f"sqlite+aiosqlite:///{ROOT_DIR}/data/forexmind.db",
+            f"sqlite+aiosqlite:///{SYSTEM_DATA}/data/forexmind.db"
+            if SYSTEM_DATA.exists()
+            else f"sqlite+aiosqlite:///{ROOT_DIR}/data/forexmind.db",
         )
     )
     # How long (seconds) to use cached price data before re-fetching
@@ -131,8 +139,12 @@ class AppConfig:
     paper_trading: bool = field(
         default_factory=lambda: os.environ.get("PAPER_TRADING", "True").lower() == "true"
     )
-    data_dir: Path = field(default_factory=lambda: ROOT_DIR / "data")
-    models_dir: Path = field(default_factory=lambda: ROOT_DIR / "models")
+    data_dir: Path = field(
+        default_factory=lambda: SYSTEM_DATA / "data" if SYSTEM_DATA.exists() else ROOT_DIR / "data"
+    )
+    models_dir: Path = field(
+        default_factory=lambda: SYSTEM_DATA / "models" if SYSTEM_DATA.exists() else ROOT_DIR / "models"
+    )
 
     def __post_init__(self) -> None:
         # Ensure critical directories exist at startup
@@ -231,11 +243,16 @@ class Settings:
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _load_yaml_config() -> dict[str, Any]:
-    """Load config.yaml from the same directory as this file."""
-    yaml_path = Path(__file__).resolve().parent / "config.yaml"
-    if yaml_path.exists():
-        with open(yaml_path, encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
+    """Load config.yaml — user override (/etc/forexmind), then package default, then dev co-located."""
+    candidates = [
+        SYSTEM_CONFIG / "config.yaml",              # user override (installed package)
+        Path("/usr/share/forexmind/config.yaml"),   # package default (installed, read-only)
+        Path(__file__).resolve().parent / "config.yaml",  # development (co-located)
+    ]
+    for yaml_path in candidates:
+        if yaml_path.exists():
+            with open(yaml_path, encoding="utf-8") as fh:
+                return yaml.safe_load(fh) or {}
     return {}
 
 

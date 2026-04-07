@@ -26,6 +26,7 @@ Advanced Python Concepts Used:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import deque
@@ -241,9 +242,12 @@ class ForexMindAgent:
             if not getattr(response, "tool_calls", None):
                 return _extract_text_content(response.content)
 
-            # Execute requested tool calls
-            for tc in response.tool_calls:
-                tool_result = await self._execute_tool(tc["name"], tc["args"])
+            # Execute all requested tool calls in parallel
+            tool_results = await asyncio.gather(*[
+                self._execute_tool(tc["name"], tc["args"])
+                for tc in response.tool_calls
+            ])
+            for tc, tool_result in zip(response.tool_calls, tool_results):
                 messages.append(
                     ToolMessage(
                         content=str(tool_result),
@@ -272,8 +276,11 @@ class ForexMindAgent:
                 messages.pop()
                 break
 
-            for tc in response.tool_calls:
-                tool_result = await self._execute_tool(tc["name"], tc["args"])
+            tool_results = await asyncio.gather(*[
+                self._execute_tool(tc["name"], tc["args"])
+                for tc in response.tool_calls
+            ])
+            for tc, tool_result in zip(response.tool_calls, tool_results):
                 messages.append(
                     ToolMessage(
                         content=str(tool_result),

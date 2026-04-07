@@ -50,36 +50,72 @@ def spread_pips(bid: float, ask: float, instrument: str) -> float:
 
 # ── Position Sizing ───────────────────────────────────────────────────────────
 
+def pip_value_usd(instrument: str, current_price: float = 1.0) -> float:
+    """
+    USD value of 1 pip movement per 1 unit for a given instrument.
+
+    Pair types:
+      USD/XXX (USD_CAD, USD_CHF, USD_JPY): pip is in quote currency → divide by current price
+      XXX/USD (EUR_USD, GBP_USD, AUD_USD): pip is already in USD → use pip_size directly
+      XXX/YYY (EUR_GBP): requires cross rate — approximate as pip_size (minor error)
+    """
+    ps = pip_size(instrument)
+    parts = instrument.split("_")
+    if len(parts) != 2:
+        return ps
+    base, quote = parts[0], parts[1]
+    if base == "USD":
+        # pip is in quote currency (CAD, CHF, JPY) — convert to USD
+        price = current_price if current_price > 0 else 1.0
+        return ps / price
+    else:
+        # pip is in USD already (EUR_USD, GBP_USD, AUD_USD) or cross (approx)
+        return ps
+
+
 def units_from_risk(
     account_balance: float,
     risk_pct: float,
     stop_loss_pips: float,
     instrument: str,
-    pip_value_per_unit: float = 1.0,
+    pip_value_per_unit: float | None = None,
+    current_price: float = 1.0,
 ) -> int:
     """
     Calculate position size (units) given a fixed-risk model.
 
     Formula:
         risk_amount = account_balance * (risk_pct / 100)
-        units = risk_amount / (stop_loss_pips * pip_value_per_unit)
+        units = risk_amount / (stop_loss_pips * pip_value_usd_per_unit)
 
     Args:
-        account_balance: Account equity in account currency (USD assumed)
+        account_balance: Account equity in USD
         risk_pct: Percentage of account to risk (e.g. 1.5 for 1.5%)
         stop_loss_pips: Distance to stop loss in pips
         instrument: e.g. "EUR_USD"
-        pip_value_per_unit: USD value of 1 pip per 1 unit traded (~0.0001 for most pairs)
+        pip_value_per_unit: USD value of 1 pip per 1 unit (auto-calculated if None)
+        current_price: Current market price (needed for USD/XXX pairs)
 
     Returns:
         Rounded position size in OANDA units (1 std lot = 100,000 units)
+
+    Hard cap: 200,000 units (2 standard lots) — prevents catastrophic sizing errors
+    from stale/tiny ATR values reaching the risk formula.
+
+    Example:
+        $100,000 account, 2% risk, 80-pip stop, EUR_USD:
+        risk_amount = $2,000
+        units = $2,000 / (80 × 0.0001) = 250,000 → capped at 200,000
     """
     if stop_loss_pips <= 0:
         return 0
+    pip_val = pip_value_per_unit if pip_value_per_unit is not None else pip_value_usd(instrument, current_price)
     risk_amount = account_balance * (risk_pct / 100.0)
-    raw_units = risk_amount / (stop_loss_pips * pip_value_per_unit * pip_size(instrument))
+    raw_units = risk_amount / (stop_loss_pips * pip_val)
     # Round down to nearest 1000 units (mini lot) for cleaner sizing
-    return max(1000, int(math.floor(raw_units / 1000) * 1000))
+    # Hard cap at 200,000 units (2 standard lots) — protects against tiny ATR producing insane sizes
+    MAX_UNITS = 200_000
+    return min(MAX_UNITS, max(1000, int(math.floor(raw_units / 1000) * 1000)))
 
 
 def kelly_fraction(win_rate: float, rr_ratio: float) -> float:

@@ -272,12 +272,32 @@ async def train_models(pair: str) -> None:
             console.print("[blue]Training LightGBM on M5 dataset...[/blue]")
             lgbm = LightGBMStrategy()
             metrics = lgbm.train(df_ind)
-            console.print(f"[green]LightGBM done. Accuracy: {metrics.get('accuracy', 0):.4f}[/green]")
+            cv_acc = metrics.get("cv_mean_accuracy", metrics.get("accuracy", 0))
+            ho_acc = metrics.get("holdout_accuracy", 0)
+            cv_std = metrics.get("cv_std_accuracy", 0)
+            ho_color = "green" if ho_acc > 0.54 else "yellow"
+            ho_note = "real edge" if ho_acc > 0.54 else "near-random — retrain with more data"
+            console.print(
+                f"[green]LightGBM done.[/green]\n"
+                f"  CV mean accuracy:  [bold]{cv_acc:.1%}[/bold] ± {cv_std:.1%} (across 5 folds)\n"
+                f"  Holdout accuracy:  [{ho_color} bold]{ho_acc:.1%}[/{ho_color} bold] ({ho_note})\n"
+                f"  Top features: {[f[0] for f in metrics.get('top_features', [])[:5]]}"
+            )
+            if cv_acc - ho_acc > 0.10:
+                console.print(
+                    f"[bold red]  ⚠ Overfitting detected: CV={cv_acc:.1%} vs Holdout={ho_acc:.1%} "
+                    f"(gap={cv_acc - ho_acc:.1%})[/bold red]"
+                )
 
         # Train LSTM per-pair on H1 data (12h lookahead, binary UP/DOWN classification)
+        # Realistic ceiling for directional LSTM on OHLCV: 53-58%. Do NOT target 70%.
         use_lstm_data = h1_feature_dfs if h1_feature_dfs else pair_feature_dfs
         lstm_label = "H1" if h1_feature_dfs else "M5"
-        console.print(f"[blue]Training LSTM on {lstm_label} per-pair (target 70% accuracy)...[/blue]")
+        LSTM_TARGET = 0.58   # Realistic ceiling — 70% is not achievable on OHLCV alone
+        console.print(
+            f"[blue]Training LSTM on {lstm_label} per-pair "
+            f"(realistic target: {LSTM_TARGET:.0%} — academic ceiling is 52-58%)...[/blue]"
+        )
         lstm = LSTMStrategy()
         lstm_metrics: dict = {}
         for pair_idx, pair_feat_df in enumerate(use_lstm_data):
@@ -286,14 +306,23 @@ async def train_models(pair: str) -> None:
             warm = pair_idx > 0  # fine-tune from prev pair after first
             pair_metrics = lstm.train(
                 pair_feat_df,
-                target_accuracy=0.70,
-                max_rows=500_000,   # H1 has ~61k rows/pair — no real cap needed
+                target_accuracy=LSTM_TARGET,
+                max_rows=500_000,
                 warm_start=warm,
             )
-            console.print(f"[dim]    {pair_name} → accuracy: {pair_metrics.get('accuracy', 0):.4f}[/dim]")
-            if pair_metrics.get("accuracy", 0) > lstm_metrics.get("accuracy", 0):
+            acc = pair_metrics.get("accuracy", 0)
+            console.print(
+                f"[dim]    {pair_name} → accuracy: {acc:.1%} "
+                f"({'✓ edge' if acc > 0.52 else '✗ coin-flip'})[/dim]"
+            )
+            if acc > lstm_metrics.get("accuracy", 0):
                 lstm_metrics = pair_metrics
-        console.print(f"[green]LSTM done. Best accuracy: {lstm_metrics.get('accuracy', 0):.4f} | Params: {lstm_metrics.get('best_params', {})}[/green]")
+        final_acc = lstm_metrics.get("accuracy", 0)
+        console.print(
+            f"[green]LSTM done. Best accuracy: [bold]{final_acc:.1%}[/bold] | "
+            f"Params: {lstm_metrics.get('best_params', {})}[/green]\n"
+            f"  {'✓ Statistically profitable at this accuracy with 2:1 R:R' if final_acc > 0.52 else '✗ Near coin-flip — LSTM will HOLD most signals (correct behaviour)'}"
+        )
 
         # Train PPO RL Agent on EUR_USD (single coherent time-series with DatetimeIndex)
         console.print("[blue]Training PPO RL Agent (~200k timesteps)...[/blue]")

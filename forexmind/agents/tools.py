@@ -20,8 +20,14 @@ Advanced Python:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Optional
+
+# ── Signal cache — avoids re-running OANDA+ML for same pair within TTL ────────
+_signal_cache: dict[str, tuple[str, float]] = {}  # key → (result_json, timestamp)
+_SIGNAL_CACHE_TTL = 20  # seconds — short enough that manual /signals feels fresh
 
 try:
     from langchain_core.tools import StructuredTool
@@ -47,8 +53,8 @@ log = get_logger(__name__)
 
 class SignalInput(BaseModel):
     instrument: str = Field(..., description="Forex pair in OANDA format, e.g. EUR_USD")
-    timeframe: str = Field("M5", description="Timeframe: M1, M5, M15, H1")
-    candles: int = Field(500, description="Number of historical candles to analyse")
+    timeframe: str = Field("H1", description="Timeframe: M15, H1, H4. H1 recommended — cleaner signals, spread is tiny vs ATR stop")
+    candles: int = Field(300, description="Number of historical candles to analyse")
 
 
 class NewsInput(BaseModel):
@@ -77,11 +83,19 @@ class PlaceTradeInput(BaseModel):
 
 # ── Tool functions ─────────────────────────────────────────────────────────────
 
-async def _get_signal(instrument: str, timeframe: str = "M5", candles: int = 500) -> str:
+async def _get_signal(instrument: str, timeframe: str = "H1", candles: int = 300) -> str:
     """
     Core signal generation tool.
     Fetches live data, computes indicators, runs ensemble, returns JSON summary.
     """
+    # Serve from cache if fresh enough
+    cache_key = f"{instrument}:{timeframe}"
+    cached = _signal_cache.get(cache_key)
+    # Only cache background/auto calls — if candles arg is explicitly small (200)
+    # it's a quick scan; still cache. But honor TTL strictly.
+    if cached and (time.monotonic() - cached[1]) < _SIGNAL_CACHE_TTL:
+        return cached[0]
+
     try:
         from forexmind.data.oanda_client import get_oanda_client
         from forexmind.indicators.engine import get_indicator_engine
@@ -91,10 +105,24 @@ async def _get_signal(instrument: str, timeframe: str = "M5", candles: int = 500
         from forexmind.utils.helpers import format_price, price_to_pips, pip_size
         from forexmind.config.settings import get_settings
 
-        # Fetch data
         client = get_oanda_client()
-        price = await client.get_price(instrument)
-        df = await client.get_candles(instrument, timeframe, candles)
+
+        # Fetch price, candles, and HTF candles all in parallel
+        # HTF context: M15→H1, H1→H4, H4→D
+        htf_map = {"M1": "M15", "M5": "H1", "M15": "H1", "H1": "H4", "H4": "D"}
+        htf_tf = htf_map.get(timeframe)
+        if htf_tf:
+            price, df, htf_df_raw = await asyncio.gather(
+                client.get_price(instrument),
+                client.get_candles(instrument, timeframe, candles),
+                client.get_candles(instrument, htf_tf, 100),
+            )
+        else:
+            price, df = await asyncio.gather(
+                client.get_price(instrument),
+                client.get_candles(instrument, timeframe, candles),
+            )
+            htf_df_raw = None
 
         if df.empty:
             return json.dumps({"error": f"No price data available for {instrument}"})
@@ -105,16 +133,15 @@ async def _get_signal(instrument: str, timeframe: str = "M5", candles: int = 500
         snap = engine.snapshot(df_ind, instrument, timeframe)
         score = score_snapshot(snap)
 
-        # Fetch HTF context
+        # HTF context
         htf_df = None
-        if timeframe in ("M1", "M5"):
-            htf_df_raw = await client.get_candles(instrument, "H1", 100)
-            if not htf_df_raw.empty:
-                htf_df = engine.compute(htf_df_raw)
+        if htf_df_raw is not None and not htf_df_raw.empty:
+            htf_df = engine.compute(htf_df_raw)
 
-        # Ensemble signal
+        # Ensemble signal (pass bid/ask for spread filter)
         ensemble = get_ensemble()
-        sig = ensemble.generate_signal(df_ind, instrument, timeframe, price.mid, htf_df)
+        sig = ensemble.generate_signal(df_ind, instrument, timeframe, price.mid, htf_df,
+                                       bid=price.bid, ask=price.ask)
 
         # News sentiment
         news = get_news_aggregator()
@@ -161,6 +188,8 @@ async def _get_signal(instrument: str, timeframe: str = "M5", candles: int = 500
                 "macd_cross": snap["macd_cross"],
                 "adx": round(snap["adx"], 1),
                 "adx_trend_strength": snap["adx_trend_strength"],
+                "dmp": round(snap["dmp"], 1),
+                "dmn": round(snap["dmn"], 1),
                 "psar_signal": snap["psar_signal"],
                 "stoch_k": round(snap["stoch_k"], 1),
                 "stoch_cross": snap["stoch_cross"],
@@ -180,7 +209,9 @@ async def _get_signal(instrument: str, timeframe: str = "M5", candles: int = 500
             "news_sentiment": sentiment,
             "reasoning": sig.reasoning,
         }
-        return json.dumps(result, indent=2, default=str)
+        result_json = json.dumps(result, indent=2, default=str)
+        _signal_cache[cache_key] = (result_json, time.monotonic())
+        return result_json
 
     except Exception as e:
         log.error(f"get_signal error: {e}")

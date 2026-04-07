@@ -356,6 +356,12 @@ class OandaClient:
                 float(p.get("long", {}).get("units", 0)) != 0
                 or float(p.get("short", {}).get("units", 0)) != 0]
 
+    async def get_open_trades(self) -> list[dict[str, Any]]:
+        """Return open trades with individual trade IDs (required for closing)."""
+        request = trades_ep.TradesList(self._cfg.account_id, params={"state": "OPEN"})
+        data = await asyncio.to_thread(self._client.request, request)
+        return data.get("trades", [])
+
 
 # ── Singleton factory ─────────────────────────────────────────────────────────
 

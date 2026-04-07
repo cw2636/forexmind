@@ -241,8 +241,9 @@ class Backtester:
         equity_curve: list[float] = [capital]
         completed_trades: list[BacktestTrade] = []
 
-        # State: currently open simulated trade
-        open_trade: dict | None = None
+        # State: list of open simulated trades (supports concurrent positions)
+        open_trades: list[dict] = []
+        max_concurrent = self._cfg.max_concurrent_trades
 
         ps = pip_size(instrument)
         slippage = self._cfg.slippage_pips * ps
@@ -254,11 +255,28 @@ class Backtester:
             current_high = float(candle["high"])
             current_low = float(candle["low"])
 
-            # ── Check if open trade was hit ────────────────────────────────────
-            if open_trade is not None:
+            # ── Check all open trades for SL/TP hits ──────────────────────────
+            still_open: list[dict] = []
+            for open_trade in open_trades:
                 direction = open_trade["direction"]
                 sl = open_trade["sl"]
                 tp = open_trade["tp"]
+                entry = open_trade["entry_price"]
+
+                # ── Breakeven stop management ─────────────────────────────────
+                # Once price moves 1R in profit, slide SL to entry+1pip (risk-free).
+                # This is applied before the SL/TP hit check so the new SL is used
+                # for the current bar's evaluation.
+                if not open_trade.get("breakeven_triggered", False):
+                    risk_distance = abs(entry - sl)  # 1R distance
+                    if direction == "BUY" and current_high >= entry + risk_distance:
+                        open_trade["sl"] = entry + ps  # 1 pip profit lock-in
+                        open_trade["breakeven_triggered"] = True
+                        sl = open_trade["sl"]
+                    elif direction == "SELL" and current_low <= entry - risk_distance:
+                        open_trade["sl"] = entry - ps
+                        open_trade["breakeven_triggered"] = True
+                        sl = open_trade["sl"]
 
                 hit_sl = hit_tp = False
                 if direction == "BUY":
@@ -269,14 +287,19 @@ class Backtester:
                     hit_tp = current_low <= tp
 
                 if hit_tp or hit_sl:
-                    exit_price = tp if hit_tp else sl
-                    exit_reason = "tp" if hit_tp else "sl"
+                    # Apply exit slippage: fills are slightly worse than the exact level
+                    if hit_tp:
+                        exit_price = tp - slippage if direction == "BUY" else tp + slippage
+                        exit_reason = "tp"
+                    else:
+                        exit_price = sl - slippage if direction == "BUY" else sl + slippage
+                        exit_reason = "sl"
                     trade = BacktestTrade(
                         entry_time=open_trade["entry_time"],
                         exit_time=current_bar_dt.to_pydatetime(),
                         instrument=instrument,
                         direction=direction,
-                        entry_price=open_trade["entry_price"],
+                        entry_price=entry,
                         exit_price=exit_price,
                         stop_loss=sl,
                         take_profit=tp,
@@ -287,11 +310,12 @@ class Backtester:
                     capital += trade.pnl_usd
                     equity_curve.append(capital)
                     completed_trades.append(trade)
-                    open_trade = None
-                    continue
+                else:
+                    still_open.append(open_trade)
+            open_trades = still_open
 
-            # ── Check for new signal (only if no open trade) ─────────────────
-            if open_trade is None:
+            # ── Check for new signal (if capacity available) ──────────────────
+            if len(open_trades) < max_concurrent:
                 history = df_ind.iloc[max(0, i - 500):i + 1]
                 sig = strategy.generate_signal(
                     history, instrument, timeframe, current_price
@@ -299,15 +323,17 @@ class Backtester:
 
                 if sig.is_actionable:
                     entry_price = sig.entry_price + (slippage if sig.direction == "BUY" else -slippage)
-                    # Realistic units calculation
                     stop_pips = price_to_pips(abs(entry_price - sig.stop_loss), instrument)
                     if stop_pips <= 0:
                         continue
-                    risk_usd = capital * self._cfg.risk_pct_per_trade / 100.0
+                    # Risk per trade scales with capital; divide by concurrent
+                    # trades to avoid over-exposing on correlated positions
+                    effective_risk_pct = self._cfg.risk_pct_per_trade / max(1, max_concurrent)
+                    risk_usd = capital * effective_risk_pct / 100.0
                     units = max(1000, int(risk_usd / (stop_pips * ps)))
                     commission = (units / 100_000) * self._cfg.commission_per_lot
 
-                    open_trade = {
+                    open_trades.append({
                         "direction": sig.direction,
                         "entry_price": entry_price,
                         "sl": sig.stop_loss,
@@ -315,11 +341,11 @@ class Backtester:
                         "units": units,
                         "commission": commission,
                         "entry_time": current_bar_dt.to_pydatetime(),
-                    }
+                    })
 
-        # Force-close remaining open trade at last price
-        if open_trade is not None:
-            last_price = float(df_ind["close"].iloc[-1])
+        # Force-close any remaining open trades at last price
+        last_price = float(df_ind["close"].iloc[-1])
+        for open_trade in open_trades:
             trade = BacktestTrade(
                 entry_time=open_trade["entry_time"],
                 exit_time=df_ind.index[-1].to_pydatetime(),
