@@ -32,7 +32,6 @@ from forexmind.utils.helpers import (
     kelly_fraction,
     price_to_pips,
     units_from_risk,
-    pip_size,
 )
 from forexmind.utils.logger import get_logger
 
@@ -122,6 +121,9 @@ class RiskManager:
         self._daily_pnl_usd: float = 0.0
         self._daily_pnl_date: str = ""
         self._lock = asyncio.Lock()
+        # Live win-rate tracking — feeds real data into Kelly sizing
+        self._wins: int = 0
+        self._losses: int = 0
 
     def calculate_risk(
         self,
@@ -176,7 +178,10 @@ class RiskManager:
         tp_pips = price_to_pips(abs(take_profit - entry), instrument)
 
         # ── Position Sizing ────────────────────────────────────────────────────
-        kelly = kelly_fraction(win_rate_estimate, rr)
+        # Use measured win rate if we have enough trades; fall back to estimate
+        measured_wr = self.measured_win_rate
+        effective_win_rate = measured_wr if measured_wr is not None else win_rate_estimate
+        kelly = kelly_fraction(effective_win_rate, rr)
 
         # Risk %: use AI override if provided, else Kelly-informed default
         if ai_risk_pct is not None:
@@ -193,14 +198,12 @@ class RiskManager:
         risk_usd = account_balance * risk_pct / 100.0
         reward_usd = risk_usd * rr
 
-        # Compute units (1 standard lot = 100,000 units)
-        pip_val = pip_size(instrument)
         units = units_from_risk(
             account_balance=account_balance,
             risk_pct=risk_pct,
             stop_loss_pips=stop_pips,
             instrument=instrument,
-            pip_value_per_unit=pip_val,
+            current_price=entry,
         )
 
         rr_actual = tp_pips / stop_pips if stop_pips > 0 else 0.0
@@ -289,7 +292,7 @@ class RiskManager:
 
     async def close_trade(self, trade_id: str, exit_price: float) -> float:
         """
-        Deregister a closed trade and update daily P&L.
+        Deregister a closed trade and update daily P&L and win rate tracker.
         Returns P&L in pips.
         """
         async with self._lock:
@@ -303,7 +306,17 @@ class RiskManager:
                 pnl_pips = (trade.entry_price - exit_price) / ps
             # Approximate USD P&L (assumes 1 pip ≈ $0.0001 per unit for major pairs)
             self._daily_pnl_usd += pnl_pips * trade.units * ps
-            log.info(f"Trade closed: {trade_id} P&L = {pnl_pips:.1f} pips")
+            # Update live win rate counter
+            if pnl_pips > 0:
+                self._wins += 1
+            else:
+                self._losses += 1
+            log.info(
+                f"Trade closed: {trade_id} P&L = {pnl_pips:.1f} pips | "
+                f"Live W/L: {self._wins}/{self._losses} "
+                f"({self.measured_win_rate:.1%} WR)" if self.measured_win_rate else
+                f"Trade closed: {trade_id} P&L = {pnl_pips:.1f} pips"
+            )
             return pnl_pips
 
     @property
@@ -319,6 +332,29 @@ class RiskManager:
         return self._daily_pnl_usd < 0 and abs(self._daily_pnl_usd) >= (
             10000 * self._cfg.max_daily_loss_pct / 100.0  # Rough check
         )
+
+    @property
+    def measured_win_rate(self) -> float | None:
+        """
+        Returns the live measured win rate once we have >= 30 closed trades.
+        Returns None before that threshold — too few trades to be reliable.
+        """
+        total = self._wins + self._losses
+        if total < 30:
+            return None
+        return self._wins / total
+
+    @property
+    def trade_stats(self) -> dict:
+        """Summary of live trading statistics."""
+        total = self._wins + self._losses
+        return {
+            "wins": self._wins,
+            "losses": self._losses,
+            "total_closed": total,
+            "win_rate": round(self._wins / total, 4) if total > 0 else None,
+            "using_measured_wr": self.measured_win_rate is not None,
+        }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
