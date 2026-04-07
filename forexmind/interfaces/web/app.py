@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -83,6 +84,11 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
+
+# Simple TTL cache for /api/signals — avoids hammering OANDA+ML on every refresh
+_signals_cache: dict | None = None
+_signals_cache_time: float = 0
+SIGNALS_CACHE_TTL = 60  # seconds
 
 
 # ── Background task: periodic signal updates ─────────────────────────────────
@@ -188,14 +194,41 @@ async def get_signal(instrument: str, timeframe: str = "M5"):
 
 
 @app.get("/api/signals")
-async def get_all_signals(timeframe: str = "M5"):
-    """Get signals for all recommended pairs in the current session."""
+async def get_all_signals(timeframe: str = "H1", refresh: bool = False):
+    """Get signals for all recommended pairs — H1 primary + M15 entry confirmation."""
+    global _signals_cache, _signals_cache_time
+
+    # Serve from cache if fresh and not explicitly bypassed
+    if not refresh and _signals_cache and (time.monotonic() - _signals_cache_time) < SIGNALS_CACHE_TTL:
+        return _signals_cache
+
     from forexmind.utils.session_times import best_pairs_for_session
     from forexmind.agents.tools import _get_signal
 
     pairs = best_pairs_for_session()[:6]
-    tasks = [_get_signal(pair, timeframe) for pair in pairs]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Fetch H1 (trend) and M15 (entry) in parallel for all pairs
+    h1_tasks = [_get_signal(pair, "H1", 300) for pair in pairs]
+    m15_tasks = [_get_signal(pair, "M15", 200) for pair in pairs]
+    h1_results, m15_results = await asyncio.gather(
+        asyncio.gather(*h1_tasks, return_exceptions=True),
+        asyncio.gather(*m15_tasks, return_exceptions=True),
+    )
+
+    # Merge M15 alignment info into H1 signal
+    results = []
+    for h1_res, m15_res in zip(h1_results, m15_results):
+        if isinstance(h1_res, Exception):
+            results.append(h1_res)
+            continue
+        try:
+            h1_data = json.loads(h1_res)
+            m15_data = json.loads(m15_res) if isinstance(m15_res, str) else {}
+            h1_action = h1_data.get("signal", {}).get("action", "HOLD")
+            m15_action = m15_data.get("signal", {}).get("action", "HOLD")
+            h1_data["m15_aligned"] = (h1_action == m15_action and h1_action != "HOLD")
+            results.append(json.dumps(h1_data))
+        except Exception:
+            results.append(h1_res)
 
     signals = []
     for pair, result in zip(pairs, results):
@@ -207,7 +240,10 @@ async def get_all_signals(timeframe: str = "M5"):
         else:
             signals.append({"instrument": pair, "error": str(result)})
 
-    return {"signals": signals, "count": len(signals)}
+    payload = {"signals": signals, "count": len(signals), "cached_at": datetime.now(timezone.utc).isoformat()}
+    _signals_cache = payload
+    _signals_cache_time = time.monotonic()
+    return payload
 
 
 @app.get("/api/account")
@@ -233,7 +269,7 @@ async def get_news(instrument: str, lookback_hours: int = 4):
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest) -> ChatResponse:
-    """Chat with the Claude trading agent."""
+    """Chat with the Claude trading agent (non-streaming fallback)."""
     try:
         from forexmind.agents.claude_agent import get_agent
         agent = get_agent()
@@ -246,6 +282,23 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """Stream the Claude agent response token-by-token via Server-Sent Events."""
+    async def event_generator():
+        try:
+            from forexmind.agents.claude_agent import get_agent
+            agent = get_agent()
+            async for chunk in agent.stream_chat(request.message):
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.websocket("/ws/signals")
