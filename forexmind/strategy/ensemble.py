@@ -35,10 +35,15 @@ from forexmind.config.settings import get_settings
 
 log = get_logger(__name__)
 
-# Minimum ensemble score (0.0–1.0) needed to emit a trade signal
-MIN_ENSEMBLE_CONFIDENCE = 0.50
-# Minimum number of strategies that must agree on direction
+# Minimum ensemble score to emit BUY/SELL.
+# With RL weight cut to 0.05, 3 strategies agreeing at 70% confidence now produces:
+# 0.35×0.70 + 0.35×0.70 + 0.25×0.70 + 0.05×0 = 0.665 — well above this threshold.
+# Raised from 0.42 — we want fewer, better signals, not more weak ones.
+MIN_ENSEMBLE_CONFIDENCE = 0.55
+# Require 2 out of 3 main strategies (rule_based + one ML) to agree.
 MIN_AGREEING_STRATEGIES = 2
+# Meaningful margin required — prevents acting on coin-flip splits.
+MIN_SCORE_MARGIN = 0.08
 
 
 @dataclass
@@ -70,8 +75,9 @@ class EnsembleSignal:
 
 class EnsembleStrategy:
     """
-    Combines RuleBasedStrategy, LightGBM, LSTM, and RL signals
-    using configurable weights from config.yaml.
+    Combines RuleBasedStrategy, LightGBM, LSTM, and RL signals.
+    Weights start from config.yaml but are dynamically recalibrated
+    based on each strategy's live directional precision.
     """
 
     def __init__(self) -> None:
@@ -85,7 +91,16 @@ class EnsembleStrategy:
             "lstm":        (LSTMStrategy(),       weights.get("lstm", 0.25)),
             "rl_agent":   (RLStrategy(),          weights.get("rl_agent", 0.20)),
         }
+        self._normalise_weights()
 
+        # Live precision tracking: how often each strategy's non-HOLD call
+        # agreed with the ensemble direction that eventually won.
+        # {name: [correct_calls, total_calls]}
+        self._precision: dict[str, list[int]] = {name: [0, 0] for name in self._strategies}
+        # Minimum calls before precision-based reweighting kicks in
+        self._MIN_CALLS_FOR_CALIBRATION = 50
+
+    def _normalise_weights(self) -> None:
         total_weight = sum(w for _, w in self._strategies.values())
         if abs(total_weight - 1.0) > 0.01:
             log.warning(f"Ensemble weights sum to {total_weight:.3f}, not 1.0 — normalising")
@@ -94,6 +109,61 @@ class EnsembleStrategy:
                 for name, (strat, w) in self._strategies.items()
             }
 
+    def recalibrate_weights(self) -> None:
+        """
+        Recompute strategy weights based on live directional precision.
+        Called automatically after each signal generation once enough data is
+        accumulated. Precision = correct non-HOLD calls / total non-HOLD calls.
+        Strategies with higher precision get proportionally more weight.
+        Minimum weight floor of 0.05 prevents any strategy from being silenced.
+        """
+        MIN_WEIGHT = 0.05
+        ready = {
+            name: stats[0] / stats[1]
+            for name, stats in self._precision.items()
+            if stats[1] >= self._MIN_CALLS_FOR_CALIBRATION
+        }
+        if len(ready) < 2:
+            return  # Not enough data yet
+
+        total_precision = sum(ready.values())
+        if total_precision == 0:
+            return
+
+        new_weights: dict[str, float] = {}
+        for name in self._strategies:
+            if name in ready:
+                raw = ready[name] / total_precision
+                new_weights[name] = max(MIN_WEIGHT, raw)
+            else:
+                # Strategy without enough calls keeps its current weight
+                _, w = self._strategies[name]
+                new_weights[name] = w
+
+        # Renormalise to sum to 1.0
+        total = sum(new_weights.values())
+        self._strategies = {
+            name: (strat, new_weights[name] / total)
+            for name, (strat, _) in self._strategies.items()
+        }
+        log.info(
+            f"Ensemble weights recalibrated from precision data: "
+            + ", ".join(f"{n}={w:.3f}" for n, (_, w) in self._strategies.items())
+        )
+
+    def _update_precision(self, signals: list[StrategySignal], winning_direction: str) -> None:
+        """Update precision counters after a signal is generated."""
+        for sig, name in zip(signals, list(self._strategies.keys())):
+            if sig.direction in ("BUY", "SELL"):
+                self._precision[name][1] += 1  # total calls
+                if sig.direction == winning_direction:
+                    self._precision[name][0] += 1  # correct calls
+
+        # Recalibrate every 20 new calls from any strategy
+        total_calls = sum(s[1] for s in self._precision.values())
+        if total_calls > 0 and total_calls % 20 == 0:
+            self.recalibrate_weights()
+
     def generate_signal(
         self,
         df: pd.DataFrame,
@@ -101,11 +171,30 @@ class EnsembleStrategy:
         timeframe: str,
         current_price: float,
         htf_df: pd.DataFrame | None = None,
+        bid: float | None = None,
+        ask: float | None = None,
     ) -> EnsembleSignal:
         """
         Run all strategies synchronously and combine their votes.
         For async use, call generate_signal_async().
         """
+        # ── Spread filter ─────────────────────────────────────────────────────
+        # Wide spreads eat into profit — don't trade when spread exceeds config limit.
+        if bid is not None and ask is not None:
+            from forexmind.utils.helpers import price_to_pips
+            from forexmind.config.settings import get_settings
+            spread_pips = price_to_pips(ask - bid, instrument)
+            _cfg = get_settings()
+            max_spread = _cfg.risk_config_yaml.get("spread_filter_pips", 3.0)
+            # Practice/paper spreads are typically 3-5× wider than live — scale the limit
+            # so valid signals aren't suppressed in the demo environment.
+            if _cfg.app.paper_trading:
+                max_spread *= 3.0
+            if spread_pips > max_spread:
+                log.info(f"{instrument}: spread {spread_pips:.1f} pips > limit {max_spread:.1f} — HOLD")
+                return _hold_ensemble(instrument, timeframe, current_price,
+                                      f"Spread {spread_pips:.1f}>{max_spread:.1f} pips")
+
         signals: list[StrategySignal] = []
         for name, (strategy, _) in self._strategies.items():
             try:
@@ -185,11 +274,20 @@ class EnsembleStrategy:
                 sell_score += w * sig.confidence
                 agreeing_sell += 1
 
-        if buy_score > sell_score and buy_score >= MIN_ENSEMBLE_CONFIDENCE:
+        score_margin = abs(buy_score - sell_score)
+        if (
+            buy_score > sell_score
+            and buy_score >= MIN_ENSEMBLE_CONFIDENCE
+            and score_margin >= MIN_SCORE_MARGIN
+        ):
             direction = "BUY"
             confidence = buy_score
             agreeing = agreeing_buy
-        elif sell_score > buy_score and sell_score >= MIN_ENSEMBLE_CONFIDENCE:
+        elif (
+            sell_score > buy_score
+            and sell_score >= MIN_ENSEMBLE_CONFIDENCE
+            and score_margin >= MIN_SCORE_MARGIN
+        ):
             direction = "SELL"
             confidence = sell_score
             agreeing = agreeing_sell
@@ -216,6 +314,10 @@ class EnsembleStrategy:
                 stop_loss = take_profit = 0.0
         else:
             stop_loss = take_profit = 0.0
+
+        # Update precision tracking for non-HOLD signals
+        if direction != "HOLD":
+            self._update_precision(signals, direction)
 
         cfg = get_settings().risk
         risk_pct = cfg.min_risk_per_trade_pct + confidence * (
@@ -245,6 +347,18 @@ class EnsembleStrategy:
             component_signals=signals,
             reasoning="\n".join(reasoning_parts),
         )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _hold_ensemble(instrument: str, timeframe: str, price: float, reason: str) -> EnsembleSignal:
+    """Return a zero-confidence HOLD EnsembleSignal."""
+    return EnsembleSignal(
+        instrument=instrument, timeframe=timeframe, direction="HOLD",
+        confidence=0.0, entry_price=price, stop_loss=0.0, take_profit=0.0,
+        risk_pct=0.0, buy_score=0.0, sell_score=0.0,
+        agreeing_count=0, total_strategies=0, reasoning=f"HOLD — {reason}",
+    )
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

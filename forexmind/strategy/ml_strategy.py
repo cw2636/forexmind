@@ -174,12 +174,19 @@ class LightGBMStrategy(BaseStrategy):
         joblib.dump({"model": self._model, "feature_cols": self._feature_cols}, path)
         log.info(f"LightGBM model saved to {path}")
 
-    def train(self, df: pd.DataFrame) -> dict:
+    def train(self, df: pd.DataFrame, forward_bars: int = 12) -> dict:
         """
         Train the LightGBM classifier on a feature-engineered DataFrame.
-        Uses TimeSeriesSplit (no look-ahead bias).
 
-        Returns metrics dict: {accuracy, f1, feature_importances}
+        Key integrity guarantees:
+          1. Final 20% of data is a true holdout — never seen during CV.
+          2. TimeSeriesSplit respects temporal ordering within the CV portion.
+          3. A purge gap of `forward_bars` rows is removed between each train/val
+             fold to prevent target leakage (overlapping forward windows).
+          4. Reports MEAN CV accuracy across all folds, not the best fold.
+          5. Final model is retrained on the full CV portion (not just best fold).
+
+        Returns metrics dict: {cv_mean_accuracy, holdout_accuracy, ...}
         """
         if not SKLEARN_AVAILABLE:
             raise ImportError("lightgbm and scikit-learn required for training")
@@ -189,24 +196,47 @@ class LightGBMStrategy(BaseStrategy):
 
         # Skip feature engineering if already pre-computed (multi-pair training path)
         if "target" in df.columns:
-            feat_df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["rsi", "macd", "adx"]).copy()
+            feat_df = df.replace([np.inf, -np.inf], np.nan).dropna(
+                subset=["rsi", "macd", "adx", "target"]
+            ).copy()
         else:
-            feat_df = build_feature_matrix(df, add_target=True)
+            feat_df = build_feature_matrix(df, add_target=True, forward_bars=forward_bars)
         self._feature_cols = get_feature_columns(feat_df)
 
+        # ── Binary classification: drop HOLD rows (same approach as LSTM) ──────
+        # 3-class on noisy M5 OHLCV is near-random because HOLD is not a
+        # learnable pattern — it's just "nothing happened." Binary UP/DOWN
+        # gives a clean signal with a 50% baseline to beat.
+        feat_df = feat_df[feat_df["target"] != 0].copy()
+        log.info(f"Binary classification: {len(feat_df):,} directional rows (HOLD dropped)")
+
         X = feat_df[self._feature_cols].values
-        y = feat_df["target"].values         # -1, 0, 1
-        y_mapped = y + 1                     # LightGBM needs 0, 1, 2
+        y = feat_df["target"].values.astype(int)   # -1 or +1
+        y_mapped = ((y + 1) // 2).astype(int)       # 0=SELL, 1=BUY
 
-        # Time-series cross-validation
-        tscv = TimeSeriesSplit(n_splits=self._cfg.ml_config.get("cv_folds", 5))
+        # ── True holdout: last 20% of data never touched during CV ────────────
+        holdout_split = int(len(X) * 0.80)
+        X_cv, y_cv = X[:holdout_split], y_mapped[:holdout_split]
+        X_holdout, y_holdout = X[holdout_split:], y_mapped[holdout_split:]
 
+        log.info(
+            f"LightGBM training: {len(X_cv):,} CV rows, {len(X_holdout):,} holdout rows | "
+            f"{len(self._feature_cols)} features"
+        )
+
+        # ── Time-series cross-validation with purge gap ───────────────────────
+        n_splits = self._cfg.ml_config.get("cv_folds", 5)
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+        fold_accs: list[float] = []
         best_val_acc = 0.0
         best_model = None
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y_mapped[train_idx], y_mapped[val_idx]
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X_cv)):
+            # Purge: remove `forward_bars` rows at the end of train to prevent
+            # target leakage (train row i has a target that overlaps with val row i+1)
+            purged_train_idx = train_idx[:-forward_bars] if len(train_idx) > forward_bars else train_idx
+            X_train, X_val = X_cv[purged_train_idx], X_cv[val_idx]
+            y_train, y_val = y_cv[purged_train_idx], y_cv[val_idx]
 
             classes = np.unique(y_train)
             weights = compute_class_weight("balanced", classes=classes, y=y_train)
@@ -230,30 +260,82 @@ class LightGBMStrategy(BaseStrategy):
                 )),
             ])
             pipeline.fit(X_train, y_train, clf__sample_weight=sample_weight)
-
             val_acc = pipeline.score(X_val, y_val)
-            log.debug(f"LightGBM fold {fold+1} val accuracy: {val_acc:.4f}")
+            fold_accs.append(val_acc)
+            log.debug(f"LightGBM fold {fold+1}/{n_splits} val accuracy: {val_acc:.4f}")
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_model = pipeline
 
-        self._model = best_model
-        self.save()
+        cv_mean_acc = float(np.mean(fold_accs))
+        cv_std_acc = float(np.std(fold_accs))
+        log.info(
+            f"LightGBM CV complete. "
+            f"Mean accuracy: {cv_mean_acc:.4f} ± {cv_std_acc:.4f} | "
+            f"Best fold: {best_val_acc:.4f} | "
+            f"Folds: {[f'{a:.4f}' for a in fold_accs]}"
+        )
 
-        # Final report on last held-out fold
-        y_pred = best_model.predict(X_val)
-        report = classification_report(y_val, y_pred, target_names=["SELL", "HOLD", "BUY"], output_dict=True)
-        log.info(f"LightGBM training complete. Best val accuracy: {best_val_acc:.4f}")
+        # ── Final model: retrain on ALL CV data (best hyperparams reused) ─────
+        classes_all = np.unique(y_cv)
+        weights_all = compute_class_weight("balanced", classes=classes_all, y=y_cv)
+        w_map_all = dict(zip(classes_all.tolist(), weights_all.tolist()))
+        sw_all = np.array([w_map_all.get(yi, 1.0) for yi in y_cv])
 
-        feat_imp = best_model.named_steps["clf"].feature_importances_
+        final_pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", lgb.LGBMClassifier(
+                n_estimators=500,
+                learning_rate=0.05,
+                num_leaves=63,
+                max_depth=7,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                random_state=42,
+                n_jobs=-1,
+                verbose=-1,
+            )),
+        ])
+        final_pipeline.fit(X_cv, y_cv, clf__sample_weight=sw_all)
+        self._model = final_pipeline
+
+        # ── Holdout evaluation ────────────────────────────────────────────────
+        holdout_acc = float(final_pipeline.score(X_holdout, y_holdout))
+        y_pred_holdout = final_pipeline.predict(X_holdout)
+        report = classification_report(
+            y_holdout, y_pred_holdout,
+            target_names=["SELL", "BUY"],
+            output_dict=True,
+        )
+        log.info(f"LightGBM HOLDOUT accuracy: {holdout_acc:.4f} (this is the real number)")
+
+        feat_imp = final_pipeline.named_steps["clf"].feature_importances_
         top_feats = sorted(
             zip(self._feature_cols, feat_imp),
             key=lambda x: x[1], reverse=True
         )[:10]
         log.info(f"Top 10 features: {top_feats}")
 
-        return {"accuracy": best_val_acc, "report": report, "top_features": top_feats}
+        # Warn if holdout accuracy is much lower than CV mean — sign of overfitting
+        if cv_mean_acc - holdout_acc > 0.10:
+            log.warning(
+                f"Possible overfitting: CV mean {cv_mean_acc:.4f} vs holdout {holdout_acc:.4f} "
+                f"(gap={cv_mean_acc - holdout_acc:.4f}). "
+                "Consider reducing n_estimators or increasing regularisation."
+            )
+
+        self.save()
+        return {
+            "cv_mean_accuracy": round(cv_mean_acc, 4),
+            "cv_std_accuracy": round(cv_std_acc, 4),
+            "cv_fold_accuracies": [round(a, 4) for a in fold_accs],
+            "holdout_accuracy": round(holdout_acc, 4),
+            "report": report,
+            "top_features": top_feats,
+        }
 
     def generate_signal(
         self,
@@ -270,23 +352,24 @@ class LightGBMStrategy(BaseStrategy):
             return self._hold_signal(instrument, timeframe, current_price, "Feature extraction failed")
 
         X = feat_df[self._feature_cols].iloc[[-1]].values   # Last row only
-        proba = self._model.predict_proba(X)[0]             # [P(sell), P(hold), P(buy)]
+        proba = self._model.predict_proba(X)[0]             # [P(sell), P(buy)] binary
 
-        buy_prob = proba[2]
-        sell_prob = proba[0]
-        hold_prob = proba[1]
+        sell_prob = float(proba[0])
+        buy_prob  = float(proba[1])
         confidence_threshold = self._cfg.ml_config.get("min_confidence_threshold", 0.55)
+        # Also require a minimum margin so we don't act on 51% vs 49%
+        margin = abs(buy_prob - sell_prob)
 
-        if buy_prob > confidence_threshold and buy_prob > sell_prob:
+        if buy_prob > confidence_threshold and buy_prob > sell_prob and margin >= 0.08:
             direction = "BUY"
             confidence = buy_prob
-        elif sell_prob > confidence_threshold and sell_prob > buy_prob:
+        elif sell_prob > confidence_threshold and sell_prob > buy_prob and margin >= 0.08:
             direction = "SELL"
             confidence = sell_prob
         else:
             return self._hold_signal(
                 instrument, timeframe, current_price,
-                f"LightGBM confidence too low: buy={buy_prob:.2f} sell={sell_prob:.2f}"
+                f"LightGBM: BUY={buy_prob:.2f} SELL={sell_prob:.2f} margin={margin:.2f} (threshold not met)"
             )
 
         atr = float(feat_df["atr"].iloc[-1]) if "atr" in feat_df.columns else current_price * 0.001
@@ -297,9 +380,7 @@ class LightGBMStrategy(BaseStrategy):
             instrument=instrument, timeframe=timeframe,
             direction=direction, confidence=round(confidence, 4),
             entry_price=current_price, stop_loss=stop_loss, take_profit=take_profit,
-            reasoning=(
-                f"LightGBM: BUY={buy_prob:.3f} HOLD={hold_prob:.3f} SELL={sell_prob:.3f}"
-            ),
+            reasoning=f"LightGBM binary: BUY={buy_prob:.3f} SELL={sell_prob:.3f} margin={margin:.3f}",
             source=self.name,
         )
 

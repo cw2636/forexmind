@@ -27,6 +27,7 @@ from forexmind.strategy.base import BaseStrategy, StrategySignal
 from forexmind.utils.helpers import atr_stop_loss, atr_take_profit
 from forexmind.utils.logger import get_logger
 from forexmind.config.settings import get_settings
+from forexmind.utils.session_times import get_session_status
 
 log = get_logger(__name__)
 
@@ -74,8 +75,18 @@ class RuleBasedStrategy(BaseStrategy):
         if len(df) < 50:
             return self._hold_signal(instrument, timeframe, current_price, "Insufficient data")
 
+        # Hard gate: skip during low-liquidity periods (weekends, dead hours)
+        session = get_session_status()
+        if session.is_weekend:
+            return self._hold_signal(instrument, timeframe, current_price, "Weekend — markets closed")
+        if not session.active_sessions:
+            return self._hold_signal(
+                instrument, timeframe, current_price,
+                f"No active session (score={session.session_score:.1f}) — low liquidity"
+            )
+
         snap = self._engine.snapshot(df, instrument, timeframe)
-        score = score_snapshot(snap)
+        score = score_snapshot(snap, session_score=session.session_score)
 
         if score.direction == "HOLD":
             return self._hold_signal(instrument, timeframe, current_price, score.reasoning)
@@ -85,8 +96,8 @@ class RuleBasedStrategy(BaseStrategy):
             snap, score, htf_df
         )
 
-        # Require at least 4 of 6 conditions
-        min_conditions = 4
+        # Require at least 3 of 6 conditions
+        min_conditions = 3
         if conditions_met < min_conditions:
             return self._hold_signal(
                 instrument, timeframe, current_price,
@@ -143,19 +154,22 @@ class RuleBasedStrategy(BaseStrategy):
         checks: dict[str, bool] = {}
 
         # Condition 1: HTF trend alignment
+        # Accept both full and weak alignment — weak counts as a pass but is worth less
+        # (it still contributes +1 to conditions_met, but scorer weights it lower)
         if htf_df is not None and len(htf_df) >= 50:
             htf_snap = self._engine.snapshot(htf_df, snap["instrument"], "H1")
             checks["htf_trend"] = (
-                htf_snap["ema_trend"] == "bullish" if is_long
-                else htf_snap["ema_trend"] == "bearish"
+                htf_snap["ema_trend"] in ("bullish", "weak_bullish") if is_long
+                else htf_snap["ema_trend"] in ("bearish", "weak_bearish")
             )
         else:
-            # If no HTF data, use the H1 EMA cross as a weaker filter
             checks["htf_trend"] = snap["ema_50"] > snap["ema_200"] if is_long else snap["ema_50"] < snap["ema_200"]
 
         # Condition 2: EMA stack alignment on entry TF
+        # Accept weak alignment — a turning trend is better than choppy
         checks["ema_stack"] = (
-            snap["ema_trend"] == "bullish" if is_long else snap["ema_trend"] == "bearish"
+            snap["ema_trend"] in ("bullish", "weak_bullish") if is_long
+            else snap["ema_trend"] in ("bearish", "weak_bearish")
         )
 
         # Condition 3: MACD histogram in our direction
@@ -164,9 +178,11 @@ class RuleBasedStrategy(BaseStrategy):
         )
 
         # Condition 4: RSI momentum — not overbought/oversold against us
+        # BUY: RSI 40-70 (above bearish zone, not overbought)
+        # SELL: RSI 30-70 (not deeply oversold, which would signal imminent bounce against trade)
         rsi = snap["rsi"]
         checks["rsi_ok"] = (
-            (40 < rsi < 70) if is_long else (30 < rsi < 60)
+            (40 < rsi < 70) if is_long else (30 < rsi < 70)
         )
 
         # Condition 5: Stochastic in our favour
