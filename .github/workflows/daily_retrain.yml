@@ -1,0 +1,37 @@
+name: Daily Retrain
+
+on:
+  schedule:
+    - cron: '10 5 * * *' # 05:10 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run retrain script
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          OANDA_ENVIRONMENT: practice
+        run: |
+          python scripts/ci_daily_retrain.py
+
+      - name: Upload models and metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-artifacts
+          path: artifacts/

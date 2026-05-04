@@ -1282,6 +1282,24 @@ async def _run_daily_retrain(bot, chat_id: str) -> None:
                     # call and iterate until we have TRAIN_BARS or no more data.
                     total_rows = []
                     to_time = None
+                    # helper: request with retries + exponential backoff
+                    import time, random
+                    def _api_request_with_retries(req, max_attempts: int = 5):
+                        base = 1.0
+                        for attempt in range(1, max_attempts + 1):
+                            try:
+                                return api.request(req)
+                            except Exception as e:
+                                # If error indicates count limit, re-raise immediately
+                                msg = str(e)
+                                if "Maximum value for 'count' exceeded" in msg:
+                                    raise
+                                # If rate-limited or transient, backoff and retry
+                                if attempt == max_attempts:
+                                    raise
+                                sleep_for = base * (2 ** (attempt - 1)) + random.random() * 0.5
+                                log.warning(f"OANDA request failed (attempt {attempt}/{max_attempts}): {e} — retrying in {sleep_for:.1f}s")
+                                time.sleep(sleep_for)
                     while len(total_rows) < TRAIN_BARS:
                         need = min(MAX_OANDA_COUNT, TRAIN_BARS - len(total_rows))
                         params = {
@@ -1293,7 +1311,7 @@ async def _run_daily_retrain(bot, chat_id: str) -> None:
                             params["to"] = to_time
 
                         req = _instruments.InstrumentsCandles(pair, params=params)
-                        data = api.request(req)
+                        data = _api_request_with_retries(req)
                         batch = []
                         for candle in data.get("candles", []):
                             if not candle.get("complete", True):
