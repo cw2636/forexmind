@@ -147,14 +147,16 @@ class LightGBMStrategy(BaseStrategy):
     name: ClassVar[str] = "lightgbm"
 
     def __init__(self, model_path: Path | None = None) -> None:
-        self._model: Pipeline | None = None
+        self._model: Pipeline | None = None          # combined (all-session) model
+        self._model_london: Pipeline | None = None   # London-session specialist
+        self._model_ny: Pipeline | None = None       # NY-session specialist
         self._feature_cols: list[str] = []
         self._cfg = get_settings()
         model_path = model_path or (self._cfg.app.models_dir / "lgbm_forex.pkl")
         if model_path.exists():
             self._load(model_path)
-        else:
-            log.info(f"LightGBM model not found at {model_path}. Run train() first.")
+        # Load session-specific models if available
+        self._load_session_models(model_path)
 
     def _load(self, path: Path) -> None:
         if not SKLEARN_AVAILABLE:
@@ -167,12 +169,36 @@ class LightGBMStrategy(BaseStrategy):
         except Exception as e:
             log.error(f"Failed to load LightGBM model: {e}")
 
+    def _load_session_models(self, base_path: Path) -> None:
+        """Load London and NY session-specific models if they exist alongside the base model."""
+        if not SKLEARN_AVAILABLE:
+            return
+        for session, attr in [("london", "_model_london"), ("ny", "_model_ny")]:
+            p = base_path.parent / f"lgbm_{session}.pkl"
+            if p.exists():
+                try:
+                    state = joblib.load(p)
+                    setattr(self, attr, state["model"])
+                    # Session models must share feature columns with the base model
+                    log.info(f"LightGBM {session} model loaded from {p}")
+                except Exception as e:
+                    log.warning(f"Failed to load LightGBM {session} model: {e}")
+
     def save(self, path: Path | None = None) -> None:
         if not SKLEARN_AVAILABLE or self._model is None:
             return
         path = path or (get_settings().app.models_dir / "lgbm_forex.pkl")
         joblib.dump({"model": self._model, "feature_cols": self._feature_cols}, path)
         log.info(f"LightGBM model saved to {path}")
+
+    def save_session_model(self, model: "Pipeline", session: str) -> None:
+        """Save a session-specific model (session = 'london' or 'ny')."""
+        if not SKLEARN_AVAILABLE:
+            return
+        path = get_settings().app.models_dir / f"lgbm_{session}.pkl"
+        joblib.dump({"model": model, "feature_cols": self._feature_cols}, path)
+        setattr(self, f"_model_{session}", model)
+        log.info(f"LightGBM {session} model saved to {path}")
 
     def train(self, df: pd.DataFrame, forward_bars: int = 12) -> dict:
         """
@@ -337,6 +363,18 @@ class LightGBMStrategy(BaseStrategy):
             "top_features": top_feats,
         }
 
+    def _session_model(self) -> "Pipeline | None":
+        """Return the most specific available model for the current trading session."""
+        from forexmind.utils.session_times import get_session_status
+        status = get_session_status()
+        active = status.active_sessions
+        # Prefer session-specific model; fall back to combined
+        if "London" in active and self._model_london is not None:
+            return self._model_london
+        if "New York" in active and self._model_ny is not None:
+            return self._model_ny
+        return self._model
+
     def generate_signal(
         self,
         df: pd.DataFrame,
@@ -344,15 +382,16 @@ class LightGBMStrategy(BaseStrategy):
         timeframe: str,
         current_price: float,
     ) -> StrategySignal:
-        if self._model is None or not self._feature_cols:
+        model = self._session_model()
+        if model is None or not self._feature_cols:
             return self._hold_signal(instrument, timeframe, current_price, "LightGBM model not trained")
 
         feat_df = build_feature_matrix(df, add_target=False)
         if feat_df.empty or not all(c in feat_df.columns for c in self._feature_cols):
             return self._hold_signal(instrument, timeframe, current_price, "Feature extraction failed")
 
-        X = feat_df[self._feature_cols].iloc[[-1]].values   # Last row only
-        proba = self._model.predict_proba(X)[0]             # [P(sell), P(buy)] binary
+        X = feat_df[self._feature_cols].iloc[[-1]]   # Keep as DataFrame to preserve feature names
+        proba = model.predict_proba(X)[0]            # [P(sell), P(buy)] binary
 
         sell_prob = float(proba[0])
         buy_prob  = float(proba[1])

@@ -36,10 +36,12 @@ from forexmind.config.settings import get_settings
 log = get_logger(__name__)
 
 # Minimum ensemble score to emit BUY/SELL.
-# With RL weight cut to 0.05, 3 strategies agreeing at 70% confidence now produces:
-# 0.35×0.70 + 0.35×0.70 + 0.25×0.70 + 0.05×0 = 0.665 — well above this threshold.
-# Raised from 0.42 — we want fewer, better signals, not more weak ones.
-MIN_ENSEMBLE_CONFIDENCE = 0.55
+# With 4 active strategies (rule_based=0.35, lgbm=0.30, lstm=0.25, rl=0.10):
+#   All 4 agreeing at 70%: 0.35×0.70 + 0.30×0.70 + 0.25×0.70 + 0.10×0.70 = 0.70 — passes
+#   3 agreeing at 70% (RL abstains): active weight = 0.90, redistributed → ~0.693 — passes
+#   2 agreeing at 70% (lstm+rl abstain): active weight = 0.65, redistributed → ~0.538 — HOLD
+# This ensures at least 3-strategy agreement before a trade fires.
+MIN_ENSEMBLE_CONFIDENCE = 0.62
 # Require 2 out of 3 main strategies (rule_based + one ML) to agree.
 MIN_AGREEING_STRATEGIES = 2
 # Meaningful margin required — prevents acting on coin-flip splits.
@@ -118,10 +120,13 @@ class EnsembleStrategy:
         Minimum weight floor of 0.05 prevents any strategy from being silenced.
         """
         MIN_WEIGHT = 0.05
+        # Strategies with weight 0.0 are intentionally disabled — never give them a floor
+        disabled = {name for name, (_, w) in self._strategies.items() if w == 0.0}
+
         ready = {
             name: stats[0] / stats[1]
             for name, stats in self._precision.items()
-            if stats[1] >= self._MIN_CALLS_FOR_CALIBRATION
+            if stats[1] >= self._MIN_CALLS_FOR_CALIBRATION and name not in disabled
         }
         if len(ready) < 2:
             return  # Not enough data yet
@@ -132,7 +137,9 @@ class EnsembleStrategy:
 
         new_weights: dict[str, float] = {}
         for name in self._strategies:
-            if name in ready:
+            if name in disabled:
+                new_weights[name] = 0.0
+            elif name in ready:
                 raw = ready[name] / total_precision
                 new_weights[name] = max(MIN_WEIGHT, raw)
             else:
@@ -195,22 +202,53 @@ class EnsembleStrategy:
                 return _hold_ensemble(instrument, timeframe, current_price,
                                       f"Spread {spread_pips:.1f}>{max_spread:.1f} pips")
 
+        # ── ATR spike filter — detect news/event-driven volatility ────────────
+        # If the current ATR is 2.5x+ the 20-bar rolling average, the market is
+        # in a news-event regime. Technical signals are unreliable — stay flat.
+        if "atr" in df.columns and len(df) >= 20:
+            atr_series = df["atr"].dropna()
+            if len(atr_series) >= 20:
+                current_atr = float(atr_series.iloc[-1])
+                avg_atr = float(atr_series.iloc[-20:].mean())
+                if avg_atr > 0 and current_atr > avg_atr * 2.5:
+                    reason = f"ATR spike: {current_atr:.5f} = {current_atr/avg_atr:.1f}x avg — news event likely"
+                    log.info(f"{instrument}: {reason}")
+                    return _hold_ensemble(instrument, timeframe, current_price, reason)
+
+        # ── News sentiment veto — block directional trades into strong news ────
+        # Fetch cached sentiment (no await needed — uses in-memory cache).
+        # If sentiment strongly opposes the likely direction, block the signal.
+        _news_sentiment: dict | None = None
+        try:
+            from forexmind.data.news_aggregator import get_news_aggregator
+            _news_sentiment = get_news_aggregator().get_instrument_sentiment(instrument, lookback_hours=2)
+        except Exception:
+            pass
+
         signals: list[StrategySignal] = []
-        for name, (strategy, _) in self._strategies.items():
+        for name, (strategy, weight) in self._strategies.items():
+            # Skip disabled strategies (weight=0.0) — they always HOLD anyway
+            if weight == 0.0:
+                signals.append(strategy._hold_signal(
+                    instrument, timeframe, current_price, f"{name} disabled (weight=0)"
+                ))
+                log.info(f"{name}: HOLD (disabled)")
+                continue
             try:
                 if name == "rule_based" and hasattr(strategy, "generate_signal"):
                     sig = strategy.generate_signal(df, instrument, timeframe, current_price, htf_df)  # type: ignore
                 else:
                     sig = strategy.generate_signal(df, instrument, timeframe, current_price)
                 signals.append(sig)
-                log.debug(f"{name}: {sig.direction} conf={sig.confidence:.2f}")
+                log.info(f"{name}: {sig.direction} conf={sig.confidence:.2f}")
             except Exception as e:
                 log.warning(f"Strategy {name} raised an error: {e}")
-                signals.append(BaseStrategy._hold_signal(  # type: ignore
-                    strategy, instrument, timeframe, current_price, f"{name} error: {e}"
+                signals.append(strategy._hold_signal(
+                    instrument, timeframe, current_price, f"{name} error: {e}"
                 ))
 
-        return self._combine(signals, instrument, timeframe, current_price, df)
+        result = self._combine(signals, instrument, timeframe, current_price, df)
+        return self._apply_news_veto(result, instrument, _news_sentiment)
 
     async def generate_signal_async(
         self,
@@ -241,12 +279,53 @@ class EnsembleStrategy:
                 log.warning(f"Async strategy {name} error: {e}")
                 return strat._hold_signal(instrument, timeframe, current_price, str(e))
 
+        async def _disabled_hold(strat: BaseStrategy, n: str) -> StrategySignal:
+            return strat._hold_signal(instrument, timeframe, current_price, f"{n} disabled (weight=0)")
+
         tasks = [
-            _run(name, strat, weight)
+            _run(name, strat, weight) if weight > 0.0 else _disabled_hold(strat, name)
             for name, (strat, weight) in self._strategies.items()
         ]
         signals = await asyncio.gather(*tasks)
-        return self._combine(list(signals), instrument, timeframe, current_price, df)
+        result = self._combine(list(signals), instrument, timeframe, current_price, df)
+        # ATR spike filter also applies in async path
+        if "atr" in df.columns and len(df) >= 20:
+            atr_series = df["atr"].dropna()
+            if len(atr_series) >= 20:
+                current_atr = float(atr_series.iloc[-1])
+                avg_atr = float(atr_series.iloc[-20:].mean())
+                if avg_atr > 0 and current_atr > avg_atr * 2.5:
+                    return _hold_ensemble(instrument, timeframe, current_price,
+                                         f"ATR spike: {current_atr:.5f} = {current_atr/avg_atr:.1f}x avg")
+        news_sentiment = None
+        try:
+            from forexmind.data.news_aggregator import get_news_aggregator
+            news_sentiment = get_news_aggregator().get_instrument_sentiment(instrument, lookback_hours=2)
+        except Exception:
+            pass
+        return self._apply_news_veto(result, instrument, news_sentiment)
+
+    def _apply_news_veto(
+        self,
+        sig: "EnsembleSignal",
+        instrument: str,
+        news_sentiment: dict | None,
+    ) -> "EnsembleSignal":
+        """
+        Cancel a directional signal if recent news sentiment strongly opposes it.
+        Threshold: sentiment score ≤ -0.3 blocks BUY, ≥ +0.3 blocks SELL.
+        Returns HOLD if vetoed, original signal otherwise.
+        """
+        if sig.direction == "HOLD" or news_sentiment is None:
+            return sig
+        score = float(news_sentiment.get("score", 0))
+        vetoed = (sig.direction == "BUY" and score <= -0.3) or \
+                 (sig.direction == "SELL" and score >= 0.3)
+        if vetoed:
+            reason = f"News sentiment veto: score={score:.2f} opposes {sig.direction}"
+            log.info(f"{instrument}: {reason}")
+            return _hold_ensemble(instrument, sig.timeframe, sig.entry_price, reason)
+        return sig
 
     def _combine(
         self,
@@ -256,23 +335,43 @@ class EnsembleStrategy:
         current_price: float,
         df: pd.DataFrame,
     ) -> EnsembleSignal:
-        """Weighted-vote combination of all strategy signals."""
+        """
+        Weighted-vote combination of all strategy signals.
+
+        HOLD-voting strategies abstain — their weight is redistributed
+        proportionally to the strategies that DID vote BUY or SELL.
+        This means untrained ML models don't suppress signals from working ones.
+        """
         weights = {name: w for name, (_, w) in self._strategies.items()}
         strategy_names = list(self._strategies.keys())
+
+        # Separate voters from abstainers
+        active = [(sig, name) for sig, name in zip(signals, strategy_names)
+                  if sig.direction in ("BUY", "SELL")]
+        abstain_weight = sum(weights[name] for sig, name in zip(signals, strategy_names)
+                             if sig.direction == "HOLD")
 
         buy_score = 0.0
         sell_score = 0.0
         agreeing_buy = 0
         agreeing_sell = 0
 
-        for sig, name in zip(signals, strategy_names):
-            w = weights.get(name, 0.25)
+        # Redistribute abstained weight among active voters proportionally
+        active_weight_total = 1.0 - abstain_weight
+        for sig, name in active:
+            w = weights[name]
+            if active_weight_total > 0:
+                w = w / active_weight_total   # Normalise so active weights sum to 1.0
             if sig.direction == "BUY":
                 buy_score += w * sig.confidence
                 agreeing_buy += 1
             elif sig.direction == "SELL":
                 sell_score += w * sig.confidence
                 agreeing_sell += 1
+
+        # If no strategy voted at all, HOLD
+        if not active:
+            buy_score = sell_score = 0.0
 
         score_margin = abs(buy_score - sell_score)
         if (
@@ -324,9 +423,10 @@ class EnsembleStrategy:
             cfg.max_risk_per_trade_pct - cfg.min_risk_per_trade_pct
         )
 
+        abstaining = len(signals) - len(active)
         reasoning_parts = [
             f"Ensemble: {direction} (BUY={buy_score:.3f}, SELL={sell_score:.3f})",
-            f"Agreeing: {agreeing}/{len(signals)} strategies",
+            f"Agreeing: {agreeing}/{len(signals)} strategies | Abstaining (HOLD): {abstaining}",
         ]
         for sig, name in zip(signals, strategy_names):
             reasoning_parts.append(f"  [{name}] {sig.direction} conf={sig.confidence:.2f}: {sig.reasoning[:80]}")

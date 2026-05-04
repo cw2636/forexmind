@@ -21,6 +21,7 @@ from rich.logging import RichHandler
 
 _console = Console(stderr=True)
 _initialized = False
+_is_tty = sys.stderr.isatty()
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -45,14 +46,22 @@ def _setup_root_logger(level: str = "INFO") -> None:
     except Exception:
         pass
 
-    handler = RichHandler(
-        console=_console,
-        show_time=True,
-        show_path=False,
-        rich_tracebacks=True,
-        markup=True,
-    )
-    handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%H:%M:%S]"))
+    if _is_tty:
+        # Interactive terminal — use Rich for coloured output
+        handler: logging.Handler = RichHandler(
+            console=_console,
+            show_time=True,
+            show_path=False,
+            rich_tracebacks=True,
+            markup=True,
+        )
+        handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%H:%M:%S]"))
+    else:
+        # Non-TTY (nohup, systemd, piped) — plain StreamHandler flushes on every line
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%H:%M:%S"
+        ))
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))

@@ -179,10 +179,10 @@ class RuleBasedStrategy(BaseStrategy):
 
         # Condition 4: RSI momentum — not overbought/oversold against us
         # BUY: RSI 40-70 (above bearish zone, not overbought)
-        # SELL: RSI 30-70 (not deeply oversold, which would signal imminent bounce against trade)
+        # SELL: RSI 30-60 (symmetric — not deeply oversold, not already weak)
         rsi = snap["rsi"]
         checks["rsi_ok"] = (
-            (40 < rsi < 70) if is_long else (30 < rsi < 70)
+            (40 < rsi < 70) if is_long else (30 < rsi < 60)
         )
 
         # Condition 5: Stochastic in our favour

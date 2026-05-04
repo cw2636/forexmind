@@ -1,0 +1,17 @@
+[Unit]
+Description=ForexMind Trading System
+After=network.target
+
+[Service]
+Type=simple
+User=forexmind
+WorkingDirectory=/var/lib/forexmind
+EnvironmentFile=/etc/forexmind/.env
+ExecStart=/opt/forexmind/venv/bin/python -m forexmind.main all
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

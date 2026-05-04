@@ -123,8 +123,25 @@ except Exception as e:
     metrics['lstm'] = {'error': str(e)}
     print('LSTM failed:', e)
 
-# Write metrics json
-with open(OUT_DIR / 'metrics.json', 'w') as fh:
+# Write metrics json (named retrain_metrics.json for monitoring)
+with open(OUT_DIR / 'retrain_metrics.json', 'w') as fh:
     json.dump(metrics, fh, indent=2)
 
 print('Artifacts saved to', OUT_DIR)
+
+# Call auto-rollback: monitor and potentially restore previous model
+print('\n' + '='*65)
+print('  Invoking auto-rollback evaluation')
+print('='*65)
+try:
+    from forexmind.monitoring.auto_rollback import evaluate_and_rollback
+    evaluate_and_rollback(
+        metrics_file=OUT_DIR / 'retrain_metrics.json',
+        baseline_file=OUT_DIR / 'metrics_history.json',
+        threshold=0.05  # rollback if accuracy drops >5%
+    )
+    print('Auto-rollback evaluation complete.')
+except Exception as e:
+    print(f'Warning: auto-rollback failed: {e}')
+    import traceback
+    traceback.print_exc()

@@ -106,10 +106,11 @@ async def run_scheduler_mode() -> None:
 # ── All mode (web + telegram) ─────────────────────────────────────────────────
 
 async def run_all_mode() -> None:
-    """Run web server and Telegram bot concurrently."""
+    """Run web server, Telegram bot, and scheduler concurrently."""
     tasks = [
         asyncio.create_task(run_web_mode()),
         asyncio.create_task(run_telegram_mode()),
+        asyncio.create_task(run_scheduler_mode()),
     ]
     try:
         await asyncio.gather(*tasks)
@@ -162,10 +163,10 @@ async def quick_backtest(pair: str) -> None:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-async def train_models(pair: str) -> None:
+async def train_models(pair: str, force: bool = False) -> None:
     """
-    Fetch 2 years of historical data and train LightGBM + LSTM models.
-    This will take several minutes depending on data size and hardware.
+    Fetch historical data and train LightGBM + LSTM + PPO models.
+    Set force=True to bypass the 24h age guard and always retrain.
     """
     from rich.console import Console
     from rich.progress import Progress
@@ -193,11 +194,20 @@ async def train_models(pair: str) -> None:
         from datetime import timedelta
 
         TRAIN_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY"]
-        start = datetime(2018, 1, 1, tzinfo=timezone.utc)
+        # M5 data: 2 years is ~600k bars per pair — enough for robust training
+        # without exhausting RAM on CV folds (1.8M rows killed the process).
+        m5_start = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        h1_start  = datetime(2018, 1, 1, tzinfo=timezone.utc)  # H1 is tiny, keep full history
+        start = m5_start   # shared cursor start for fetch_pair
         end = datetime(2025, 12, 31, tzinfo=timezone.utc)
 
-        console.print("[dim]Fetching M5 data (LightGBM + PPO) across 3 pairs from 2018...[/dim]")
-        m5_window = timedelta(weeks=2)
+        # Row caps: LightGBM CV on 400k rows fits comfortably in 8 GB RAM.
+        # PPO env replay is single-pair so less of an issue, but cap anyway.
+        LGBM_MAX_ROWS  = 400_000
+        PPO_MAX_ROWS   = 300_000
+
+        console.print("[dim]Fetching M5 data (LightGBM + PPO) across 3 pairs from 2023...[/dim]")
+        m5_window = timedelta(weeks=4)  # 4-week chunks → fewer API round-trips
 
         # Fetch each pair and compute FULL feature matrices per-pair (with DatetimeIndex intact),
         # then concatenate. This avoids timestamp deduplication and the 'int has no to_pydatetime' crash.
@@ -205,9 +215,9 @@ async def train_models(pair: str) -> None:
         engine = get_indicator_engine()
         pair_feature_dfs: list[pd.DataFrame] = []  # M5 per-pair, for LightGBM + PPO
 
-        async def fetch_pair(pair: str, granularity: str, window: timedelta) -> pd.DataFrame:
+        async def fetch_pair(pair: str, granularity: str, window: timedelta, fetch_start: datetime | None = None) -> pd.DataFrame:
             """Fetch and deduplicate one pair's raw OHLCV data."""
-            cursor = start
+            cursor = fetch_start or start
             chunks: list[pd.DataFrame] = []
             err_count = 0
             while cursor < end:
@@ -228,8 +238,8 @@ async def train_models(pair: str) -> None:
 
         # ── M5 fetch for LightGBM / PPO ───────────────────────────────────────
         for train_pair in TRAIN_PAIRS:
-            console.print(f"[dim]  M5 {train_pair}...[/dim]")
-            raw = await fetch_pair(train_pair, "M5", m5_window)
+            console.print(f"[dim]  M5 {train_pair} (2023–)...[/dim]")
+            raw = await fetch_pair(train_pair, "M5", m5_window, fetch_start=m5_start)
             if raw.empty:
                 console.print(f"[yellow]  {train_pair}: no M5 data, skipping.[/yellow]")
                 continue
@@ -242,18 +252,22 @@ async def train_models(pair: str) -> None:
             return
 
         df_ind = pd.concat(pair_feature_dfs, ignore_index=True)
+        # Cap rows to avoid OOM: keep the most recent data (temporally representative)
+        if len(df_ind) > LGBM_MAX_ROWS:
+            console.print(f"[yellow]LightGBM: capping {len(df_ind):,} rows → {LGBM_MAX_ROWS:,} (tail, most recent)[/yellow]")
+            df_ind = df_ind.tail(LGBM_MAX_ROWS).reset_index(drop=True)
         console.print(f"[green]M5 combined: {len(df_ind):,} rows across {len(pair_feature_dfs)} pairs.[/green]")
 
         # ── H1 fetch for LSTM ─────────────────────────────────────────────────
         # H1 bars: 1 bar = 1 hour. forward_bars=12 → predict 12h ahead.
         # ~7 years × 8760 H1 bars/year ≈ 61,000 bars per pair — fast to train.
         # Signal-to-noise is far better than M5 for directional LSTM.
-        console.print("[dim]Fetching H1 data for LSTM (12h lookahead)...[/dim]")
-        h1_window = timedelta(weeks=26)   # 26-week chunks → fewer API calls on H1
+        console.print("[dim]Fetching H1 data for LSTM (12h lookahead, 2018–)...[/dim]")
+        h1_window = timedelta(weeks=26)
         h1_feature_dfs: list[pd.DataFrame] = []
         for train_pair in TRAIN_PAIRS:
             console.print(f"[dim]  H1 {train_pair}...[/dim]")
-            raw_h1 = await fetch_pair(train_pair, "H1", h1_window)
+            raw_h1 = await fetch_pair(train_pair, "H1", h1_window, fetch_start=h1_start)
             if raw_h1.empty:
                 console.print(f"[yellow]  {train_pair}: no H1 data, skipping.[/yellow]")
                 continue
@@ -266,8 +280,8 @@ async def train_models(pair: str) -> None:
         import time as _time
         lgbm_path = get_settings().app.models_dir / "lgbm_forex.pkl"
         lgbm_age_h = (_time.time() - lgbm_path.stat().st_mtime) / 3600 if lgbm_path.exists() else 999
-        if lgbm_age_h < 24:
-            console.print(f"[yellow]LightGBM skipped — model is only {lgbm_age_h:.1f}h old (< 24h threshold).[/yellow]")
+        if lgbm_age_h < 24 and not force:
+            console.print(f"[yellow]LightGBM skipped — model is only {lgbm_age_h:.1f}h old (< 24h threshold). Use retrain to force.[/yellow]")
         else:
             console.print("[blue]Training LightGBM on M5 dataset...[/blue]")
             lgbm = LightGBMStrategy()
@@ -324,11 +338,15 @@ async def train_models(pair: str) -> None:
             f"  {'✓ Statistically profitable at this accuracy with 2:1 R:R' if final_acc > 0.52 else '✗ Near coin-flip — LSTM will HOLD most signals (correct behaviour)'}"
         )
 
-        # Train PPO RL Agent on EUR_USD (single coherent time-series with DatetimeIndex)
+        # Train PPO RL Agent — cap to PPO_MAX_ROWS to prevent huge environment
         console.print("[blue]Training PPO RL Agent (~200k timesteps)...[/blue]")
         try:
+            rl_df = pair_feature_dfs[0]
+            if len(rl_df) > PPO_MAX_ROWS:
+                rl_df = rl_df.tail(PPO_MAX_ROWS).reset_index(drop=True)
+                console.print(f"[yellow]PPO: capped to {PPO_MAX_ROWS:,} rows[/yellow]")
             rl = RLStrategy()
-            rl_metrics = rl.train(pair_feature_dfs[0], instrument=TRAIN_PAIRS[0], total_timesteps=200_000)
+            rl_metrics = rl.train(rl_df, instrument=TRAIN_PAIRS[0], total_timesteps=200_000)
             console.print(f"[green]PPO RL done. Timesteps: {rl_metrics.get('total_timesteps', 0):,}[/green]")
         except ImportError as e:
             console.print(f"[yellow]PPO RL skipped: {e}[/yellow]")
@@ -356,12 +374,13 @@ Examples:
   python main.py scheduler              Auto-scan US session, push Telegram alerts
   python main.py signal EUR/USD         Quick one-shot signal
   python main.py backtest GBP/USD       Run 1-year backtest
-  python main.py train EUR_USD          Train ML models
+  python main.py train EUR_USD          Train ML models (skips if < 24h old)
+  python main.py retrain EUR_USD        Force retrain ALL models unconditionally
         """
     )
     parser.add_argument(
         "mode",
-        choices=["cli", "web", "telegram", "all", "scheduler", "signal", "backtest", "train"],
+        choices=["cli", "web", "telegram", "all", "scheduler", "signal", "backtest", "train", "retrain"],
         help="Which interface to run",
     )
     parser.add_argument(
@@ -382,7 +401,8 @@ Examples:
         "scheduler": lambda: asyncio.run(run_scheduler_mode()),
         "signal": lambda: asyncio.run(quick_signal(args.pair)),
         "backtest": lambda: asyncio.run(quick_backtest(args.pair)),
-        "train": lambda: asyncio.run(train_models(args.pair)),
+        "train":   lambda: asyncio.run(train_models(args.pair, force=False)),
+        "retrain": lambda: asyncio.run(train_models(args.pair, force=True)),
     }
 
     try:

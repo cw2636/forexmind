@@ -103,27 +103,64 @@ def get_session_status(dt: datetime | None = None) -> SessionStatus:
     )
 
 
+def get_tp_session_multiplier(dt: datetime | None = None) -> float:
+    """
+    Return a TP size multiplier (0.5–1.0) based on session liquidity.
+    Lower liquidity → tighter TP so we capture profits before spread widens.
+    """
+    if dt is None:
+        dt = datetime.now(UTC)
+    t = dt.time()
+
+    # London + NY overlap: peak liquidity — full TP reach
+    if time(12, 0) <= t < time(16, 0):
+        return 1.0
+    # London open / Tokyo–London overlap: high liquidity
+    if time(7, 0) <= t < time(12, 0):
+        return 0.9
+    # NY afternoon (post-overlap): declining liquidity
+    if time(16, 0) <= t < time(18, 0):
+        return 0.75
+    # NY close / late session: low liquidity, slippage risk higher
+    if time(18, 0) <= t < time(21, 0):
+        return 0.60
+    # Outside normal window (shouldn't reach in production)
+    return 0.5
+
+
 def best_pairs_for_session(dt: datetime | None = None) -> list[str]:
     """
-    Suggest the most liquid pairs for the current session.
-    Used as a pre-filter by the indicator engine.
+    Return the most liquid pairs for the current session, filtered to only
+    those in the configured pairs list.
     """
+    from forexmind.config.settings import get_settings
+    configured = set(get_settings().pairs)
+
     status = get_session_status(dt)
     active = set(status.active_sessions)
 
-    recommendations: list[str] = []
+    # Ordered preference per session — tightest spreads first
+    candidates: list[str] = []
     if "London" in active or "New York" in active:
-        recommendations += ["EUR_USD", "GBP_USD", "USD_CHF", "EUR_GBP", "USD_CAD"]
+        # GBP_USD leads: highest intraday pip range (~100 pips/day vs EUR_USD's 60-80)
+        # XAU_USD: most active during London/NY (institutional gold flow)
+        candidates += ["GBP_USD", "EUR_USD", "USD_JPY", "USD_CAD", "AUD_USD", "XAU_USD"]
     if "Tokyo" in active:
-        recommendations += ["USD_JPY", "EUR_JPY", "GBP_JPY", "AUD_JPY"]
+        candidates += ["USD_JPY", "AUD_USD", "EUR_USD"]
     if "Sydney" in active:
-        recommendations += ["AUD_USD", "NZD_USD", "AUD_JPY"]
+        candidates += ["AUD_USD", "USD_JPY", "EUR_USD"]
 
-    # Dedupe while preserving order
+    # If no session active (rare gap), fall back to top majors from config
+    if not candidates:
+        candidates = ["GBP_USD", "EUR_USD", "USD_JPY", "USD_CAD", "AUD_USD"]
+
+    # Dedupe, filter to configured pairs only
     seen: set[str] = set()
     result: list[str] = []
-    for pair in recommendations:
-        if pair not in seen:
+    for pair in candidates:
+        if pair not in seen and pair in configured:
             seen.add(pair)
             result.append(pair)
-    return result
+
+    # Fallback: if filter removed everything, return all configured pairs
+    return result if result else list(configured)

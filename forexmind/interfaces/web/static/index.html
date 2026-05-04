@@ -1,419 +1,1008 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ForexMind AI Trading Dashboard</title>
-    <style>
-        :root {
-            --bg: #0d1117; --surface: #161b22; --border: #30363d;
-            --text: #e6edf3; --muted: #8b949e; --green: #3fb950;
-            --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
-            --purple: #bc8cff;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
-        header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 12px; }
-        header h1 { font-size: 1.2rem; color: var(--blue); font-weight: 700; }
-        .badge { background: #1f6feb; color: white; font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; }
-        .session-bar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 8px 24px; font-size: 0.82rem; color: var(--muted); display: flex; gap: 16px; align-items: center; }
-        .session-pill { background: var(--border); padding: 2px 10px; border-radius: 10px; font-size: 0.75rem; }
-        .session-pill.active { background: #1a4b1a; color: var(--green); }
-        .overlap-badge { background: #3d1a00; color: var(--yellow); padding: 3px 10px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
-        main { display: flex; flex: 1; overflow: hidden; }
-        .signals-panel { padding: 16px 20px; overflow-y: auto; flex: 1; min-width: 200px; }
-        .resize-handle { width: 5px; background: var(--border); cursor: col-resize; flex-shrink: 0; transition: background 0.15s; }
-        .resize-handle:hover, .resize-handle.dragging { background: var(--blue); }
-        .signals-panel h2 { font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
-        .signal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-        .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; transition: border-color 0.2s; cursor: pointer; }
-        .signal-card:hover { border-color: var(--blue); }
-        .signal-card.buy { border-left: 3px solid var(--green); }
-        .signal-card.sell { border-left: 3px solid var(--red); }
-        .signal-card.hold { border-left: 3px solid var(--muted); }
-        .signal-card.weak { border-left: 3px solid var(--yellow); }
-        .signal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-        .pair { font-size: 1rem; font-weight: 700; }
-        .action-badge { font-size: 0.75rem; font-weight: 700; padding: 3px 10px; border-radius: 4px; }
-        .action-badge.buy { background: #1a4b1a; color: var(--green); }
-        .action-badge.sell { background: #4b1a1a; color: var(--red); }
-        .action-badge.hold { background: var(--border); color: var(--muted); }
-        .action-badge.weak { background: #3d2e00; color: var(--yellow); }
-        .confidence-fill.weak { background: var(--yellow); }
-        .signal-row { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px; }
-        .signal-item { font-size: 0.78rem; }
-        .signal-item .label { color: var(--muted); font-size: 0.7rem; }
-        .confidence-bar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 8px; }
-        .confidence-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
-        .confidence-fill.buy { background: var(--green); }
-        .confidence-fill.sell { background: var(--red); }
-        /* Chat panel */
-        .chat-panel { border-left: 1px solid var(--border); display: flex; flex-direction: column; background: var(--surface); overflow: hidden; min-height: 0; width: 380px; min-width: 260px; flex-shrink: 0; }
-        .chat-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 0.85rem; font-weight: 600; color: var(--blue); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-        .chat-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
-        .msg { max-width: 95%; padding: 8px 12px; border-radius: 8px; font-size: 0.83rem; line-height: 1.5; }
-        .msg.user { background: #1f6feb22; border: 1px solid #1f6feb44; align-self: flex-end; }
-        .msg.agent { background: var(--bg); border: 1px solid var(--border); align-self: flex-start; }
-        .msg.agent pre { background: #0d1117; padding: 8px; border-radius: 4px; font-size: 0.78rem; overflow-x: auto; white-space: pre-wrap; }
-        .chat-input-row { padding: 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; flex-shrink: 0; }
-        .chat-input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 12px; font-size: 0.85rem; outline: none; }
-        .chat-input:focus { border-color: var(--blue); }
-        .chat-send { background: var(--blue); color: white; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: opacity 0.2s; }
-        .chat-send:hover { opacity: 0.85; }
-        .chat-send:disabled { opacity: 0.4; cursor: not-allowed; }
-        .typing-indicator { color: var(--muted); font-size: 0.78rem; padding: 4px 12px; }
-        /* Quick actions */
-        .quick-actions { padding: 8px 16px; display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-        .qa-btn { background: var(--bg); border: 1px solid var(--border); color: var(--muted); border-radius: 12px; padding: 3px 10px; font-size: 0.75rem; cursor: pointer; transition: all 0.2s; }
-        .qa-btn:hover { border-color: var(--blue); color: var(--blue); }
-        /* Loading spinner */
-        .spinner { border: 2px solid var(--border); border-top: 2px solid var(--blue); border-radius: 50%; width: 14px; height: 14px; animation: spin 0.8s linear infinite; display: inline-block; margin-right: 6px; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .error { color: var(--red); font-size: 0.8rem; }
-        .refresh-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 4px; padding: 4px 10px; font-size: 0.75rem; cursor: pointer; margin-left: auto; }
-        .refresh-btn:hover { border-color: var(--blue); color: var(--blue); }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ForexMind — AI Trading Dashboard</title>
+<style>
+:root {
+  --bg: #060b14;
+  --surface: #0b1220;
+  --surface2: #0f1929;
+  --border: #1a2840;
+  --border-bright: #243650;
+  --text: #dce8f5;
+  --muted: #4e6a88;
+  --green: #00e676;
+  --red: #ff3d5a;
+  --yellow: #ffc107;
+  --blue: #38b2ff;
+  --cyan: #00e5ff;
+  --purple: #9c6bff;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border-bright);border-radius:2px}
+body{
+  font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:var(--bg);color:var(--text);
+  height:100vh;display:flex;flex-direction:column;overflow:hidden;
+}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 70% 50% at 15% 5%, rgba(20,50,100,0.35) 0%, transparent 65%),
+    radial-gradient(ellipse 55% 40% at 85% 85%, rgba(10,30,65,0.3) 0%, transparent 65%);
+}
+
+/* ── Header ── */
+header{
+  position:relative;z-index:10;
+  background:rgba(10,18,30,0.97);
+  backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);
+  padding:0 20px;height:54px;
+  display:flex;align-items:center;gap:10px;flex-shrink:0;
+}
+.logo{
+  display:flex;align-items:center;gap:8px;
+  font-size:1.05rem;font-weight:800;letter-spacing:-0.5px;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.logo-icon{
+  width:28px;height:28px;border-radius:7px;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));
+  display:flex;align-items:center;justify-content:center;
+  font-size:0.85rem;-webkit-text-fill-color:white;flex-shrink:0;
+}
+.ai-badge{
+  font-size:0.65rem;font-weight:700;padding:2px 7px;border-radius:20px;
+  letter-spacing:0.6px;text-transform:uppercase;
+  background:rgba(56,178,255,0.1);border:1px solid rgba(56,178,255,0.25);color:var(--blue);
+}
+.mode-badge{
+  font-size:0.65rem;font-weight:700;padding:2px 7px;border-radius:20px;letter-spacing:0.5px;
+}
+.mode-badge.paper{background:rgba(255,193,7,0.08);border:1px solid rgba(255,193,7,0.25);color:var(--yellow);}
+.mode-badge.live{background:rgba(0,230,118,0.08);border:1px solid rgba(0,230,118,0.25);color:var(--green);}
+.header-stats{margin-left:auto;display:flex;align-items:center;gap:18px;}
+.hstat{display:flex;flex-direction:column;align-items:flex-end;gap:1px;}
+.hstat-label{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;}
+.hstat-value{font-size:0.82rem;font-weight:700;font-variant-numeric:tabular-nums;}
+.hstat-value.pos{color:var(--green);}
+.hstat-value.neg{color:var(--red);}
+.hclock{font-size:0.75rem;color:var(--muted);font-variant-numeric:tabular-nums;border-left:1px solid var(--border);padding-left:14px;}
+
+/* ── Session bar ── */
+.session-bar{
+  position:relative;z-index:10;
+  background:rgba(9,15,25,0.95);border-bottom:1px solid var(--border);
+  padding:5px 20px;display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+.session-label{font-size:0.68rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:0.5px;white-space:nowrap;}
+.session-pill{
+  padding:2px 9px;border-radius:20px;font-size:0.7rem;font-weight:600;
+  border:1px solid var(--border);color:var(--muted);transition:all 0.3s;
+}
+.session-pill.active{
+  border-color:rgba(0,230,118,0.35);color:var(--green);
+  background:rgba(0,230,118,0.07);box-shadow:0 0 8px rgba(0,230,118,0.1);
+}
+.overlap-badge{
+  padding:2px 10px;border-radius:20px;font-size:0.7rem;font-weight:700;
+  background:rgba(255,193,7,0.08);border:1px solid rgba(255,193,7,0.3);color:var(--yellow);
+  animation:glowPulse 2s ease-in-out infinite;
+}
+@keyframes glowPulse{
+  0%,100%{box-shadow:0 0 5px rgba(255,193,7,0.2);}
+  50%{box-shadow:0 0 12px rgba(255,193,7,0.5);opacity:0.85;}
+}
+
+/* ── Main layout ── */
+main{flex:1;display:flex;overflow:hidden;position:relative;z-index:1;}
+.signals-panel{flex:1;padding:14px 18px;overflow-y:auto;min-width:0;}
+.panel-header{display:flex;align-items:center;gap:8px;margin-bottom:12px;}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:livePulse 2s ease-in-out infinite;flex-shrink:0;}
+@keyframes livePulse{
+  0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(0,230,118,0.5);}
+  50%{opacity:0.7;box-shadow:0 0 0 5px rgba(0,230,118,0);}
+}
+.panel-title{font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;font-weight:700;}
+.signal-count{
+  font-size:0.7rem;padding:1px 7px;border-radius:10px;
+  background:rgba(56,178,255,0.08);border:1px solid rgba(56,178,255,0.18);color:var(--blue);
+}
+.refresh-btn{
+  margin-left:auto;background:transparent;border:1px solid var(--border);
+  color:var(--muted);border-radius:var(--radius-sm);padding:4px 10px;
+  font-size:0.72rem;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;gap:5px;
+}
+.refresh-btn:hover{border-color:var(--blue);color:var(--blue);background:rgba(56,178,255,0.06);}
+.refresh-btn.spinning svg{animation:spin 0.7s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* ── Signal grid ── */
+.signal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(265px,1fr));gap:11px;}
+
+/* ── Signal card ── */
+.signal-card{
+  background:rgba(11,18,32,0.8);backdrop-filter:blur(16px);
+  border:1px solid var(--border);border-radius:var(--radius);
+  padding:13px;cursor:default;
+  transition:transform 0.2s,border-color 0.25s,box-shadow 0.25s;
+  position:relative;overflow:hidden;
+  animation:cardIn 0.45s ease both;
+}
+@keyframes cardIn{from{opacity:0;transform:translateY(18px);}to{opacity:1;transform:translateY(0);}}
+.signal-card:nth-child(1){animation-delay:0.04s;}
+.signal-card:nth-child(2){animation-delay:0.08s;}
+.signal-card:nth-child(3){animation-delay:0.12s;}
+.signal-card:nth-child(4){animation-delay:0.16s;}
+.signal-card:nth-child(5){animation-delay:0.20s;}
+.signal-card::after{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;opacity:0;transition:opacity 0.3s;
+}
+.signal-card.buy{border-color:rgba(0,230,118,0.2);}
+.signal-card.buy::after{background:linear-gradient(90deg,transparent,var(--green),transparent);opacity:1;}
+.signal-card.sell{border-color:rgba(255,61,90,0.2);}
+.signal-card.sell::after{background:linear-gradient(90deg,transparent,var(--red),transparent);opacity:1;}
+.signal-card.buy:hover{transform:translateY(-2px);border-color:rgba(0,230,118,0.4);box-shadow:0 8px 28px rgba(0,230,118,0.1);}
+.signal-card.sell:hover{transform:translateY(-2px);border-color:rgba(255,61,90,0.4);box-shadow:0 8px 28px rgba(255,61,90,0.1);}
+.signal-card.hold:hover{transform:translateY(-1px);border-color:var(--border-bright);}
+
+/* Card header */
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+.pair-name{font-size:1rem;font-weight:800;letter-spacing:0.3px;}
+.card-badges{display:flex;align-items:center;gap:5px;}
+.action-badge{
+  font-size:0.68rem;font-weight:800;padding:2px 9px;border-radius:5px;
+  text-transform:uppercase;letter-spacing:0.4px;
+}
+.action-badge.buy{background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:var(--green);}
+.action-badge.sell{background:rgba(255,61,90,0.1);border:1px solid rgba(255,61,90,0.3);color:var(--red);}
+.action-badge.hold{background:rgba(78,106,136,0.12);border:1px solid rgba(78,106,136,0.2);color:var(--muted);}
+.align-badge{font-size:0.65rem;color:var(--green);background:rgba(0,230,118,0.07);border:1px solid rgba(0,230,118,0.18);padding:1px 6px;border-radius:4px;}
+
+/* Confidence */
+.conf-row{display:flex;align-items:center;gap:7px;margin-bottom:9px;}
+.conf-bar-wrap{flex:1;height:3px;background:var(--border);border-radius:2px;overflow:hidden;}
+.conf-bar-fill{height:100%;border-radius:2px;width:0;transition:width 1.1s cubic-bezier(0.4,0,0.2,1);}
+.conf-bar-fill.buy{background:linear-gradient(90deg,#008a45,var(--green));}
+.conf-bar-fill.sell{background:linear-gradient(90deg,#cc002e,var(--red));}
+.conf-bar-fill.hold{background:var(--muted);}
+.conf-pct{font-size:0.76rem;font-weight:700;min-width:32px;text-align:right;}
+.conf-pct.buy{color:var(--green);}
+.conf-pct.sell{color:var(--red);}
+.conf-pct.hold{color:var(--muted);}
+
+/* Signal data */
+.signal-data{display:grid;grid-template-columns:1fr 1fr;gap:5px 8px;margin-bottom:9px;}
+.sd-item .sd-lbl{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:1px;}
+.sd-item .sd-val{font-size:0.78rem;font-weight:600;}
+.sd-val.red{color:var(--red);}
+.sd-val.green{color:var(--green);}
+
+/* Card footer */
+.card-footer{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-top:8px;padding-top:8px;border-top:1px solid var(--border);
+}
+.strat-dots{display:flex;gap:4px;align-items:center;}
+.strat-dot{
+  width:7px;height:7px;border-radius:50%;
+  border:1.5px solid var(--border-bright);background:transparent;
+  transition:all 0.2s;
+}
+.strat-dot.agree-buy{background:var(--green);border-color:var(--green);box-shadow:0 0 4px rgba(0,230,118,0.5);}
+.strat-dot.agree-sell{background:var(--red);border-color:var(--red);box-shadow:0 0 4px rgba(255,61,90,0.5);}
+.strat-lbl{font-size:0.62rem;color:var(--muted);margin-left:4px;}
+.trade-btn{
+  font-size:0.7rem;font-weight:800;padding:5px 11px;border-radius:6px;
+  border:1px solid;cursor:pointer;transition:all 0.2s;text-transform:uppercase;letter-spacing:0.3px;
+}
+.trade-btn.buy{
+  background:rgba(0,230,118,0.1);border-color:rgba(0,230,118,0.35);color:var(--green);
+}
+.trade-btn.buy:hover{background:rgba(0,230,118,0.2);box-shadow:0 0 12px rgba(0,230,118,0.25);}
+.trade-btn.sell{
+  background:rgba(255,61,90,0.1);border-color:rgba(255,61,90,0.35);color:var(--red);
+}
+.trade-btn.sell:hover{background:rgba(255,61,90,0.2);box-shadow:0 0 12px rgba(255,61,90,0.25);}
+.below-threshold{font-size:0.65rem;color:var(--muted);}
+
+/* Resize handle */
+.resize-handle{width:4px;background:var(--border);cursor:col-resize;flex-shrink:0;transition:background 0.15s;z-index:5;}
+.resize-handle:hover,.resize-handle.dragging{background:var(--blue);}
+
+/* ── Chat panel ── */
+.chat-panel{
+  width:360px;min-width:240px;flex-shrink:0;
+  border-left:1px solid var(--border);
+  background:rgba(9,15,25,0.97);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.chat-header{
+  padding:9px 14px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+.chat-title{font-size:0.8rem;font-weight:700;color:var(--blue);}
+.ws-status{margin-left:auto;display:flex;align-items:center;gap:4px;font-size:0.68rem;color:var(--muted);}
+.ws-dot{width:6px;height:6px;border-radius:50%;background:var(--green);}
+.ws-dot.offline{background:var(--red);}
+.quick-actions{
+  padding:7px 10px;display:flex;flex-wrap:wrap;gap:4px;
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.qa-btn{
+  background:transparent;border:1px solid var(--border);color:var(--muted);
+  border-radius:20px;padding:3px 9px;font-size:0.7rem;cursor:pointer;transition:all 0.2s;
+}
+.qa-btn:hover{border-color:var(--blue);color:var(--blue);background:rgba(56,178,255,0.07);}
+.chat-messages{
+  flex:1;overflow-y:auto;padding:10px;
+  display:flex;flex-direction:column;gap:7px;min-height:0;
+}
+.msg{
+  max-width:93%;padding:8px 11px;border-radius:var(--radius-sm);
+  font-size:0.78rem;line-height:1.55;animation:msgIn 0.2s ease;
+}
+@keyframes msgIn{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:translateY(0);}}
+.msg.user{background:rgba(56,178,255,0.09);border:1px solid rgba(56,178,255,0.18);align-self:flex-end;}
+.msg.agent{background:rgba(255,255,255,0.03);border:1px solid var(--border);align-self:flex-start;}
+.msg.agent pre{background:var(--bg);padding:6px 8px;border-radius:4px;font-size:0.72rem;overflow-x:auto;white-space:pre-wrap;margin-top:4px;}
+.typing-indicator{
+  padding:5px 10px;display:none;align-items:center;gap:7px;
+  font-size:0.73rem;color:var(--muted);flex-shrink:0;
+}
+.typing-dots{display:flex;gap:3px;}
+.typing-dots span{
+  width:5px;height:5px;border-radius:50%;background:var(--blue);
+  animation:tdot 1.2s ease-in-out infinite;
+}
+.typing-dots span:nth-child(2){animation-delay:0.2s;}
+.typing-dots span:nth-child(3){animation-delay:0.4s;}
+@keyframes tdot{0%,80%,100%{transform:translateY(0);opacity:0.4;}40%{transform:translateY(-4px);opacity:1;}}
+.chat-input-row{padding:9px;border-top:1px solid var(--border);display:flex;gap:6px;flex-shrink:0;}
+.chat-input{
+  flex:1;background:rgba(255,255,255,0.04);border:1px solid var(--border);
+  border-radius:var(--radius-sm);color:var(--text);padding:7px 11px;
+  font-size:0.8rem;outline:none;transition:border-color 0.2s;
+}
+.chat-input:focus{border-color:var(--blue);}
+.chat-input::placeholder{color:var(--muted);}
+.send-btn{
+  background:linear-gradient(135deg,#1552a0,var(--blue));color:white;
+  border:none;border-radius:var(--radius-sm);padding:7px 14px;
+  font-size:0.8rem;font-weight:700;cursor:pointer;transition:opacity 0.2s,transform 0.1s;
+}
+.send-btn:hover{opacity:0.88;transform:translateY(-1px);}
+.send-btn:active{transform:translateY(0);}
+.send-btn:disabled{opacity:0.35;cursor:not-allowed;transform:none;}
+
+/* ── Trade Modal ── */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,0.75);
+  backdrop-filter:blur(8px);z-index:100;
+  display:none;align-items:flex-end;justify-content:center;
+}
+.modal-overlay.open{display:flex;animation:fadeIn 0.2s ease;}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+.trade-modal{
+  background:var(--surface2);
+  border:1px solid var(--border-bright);border-bottom:none;
+  border-radius:var(--radius) var(--radius) 0 0;
+  padding:18px 22px 26px;width:100%;max-width:460px;
+  animation:slideUp 0.3s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes slideUp{from{transform:translateY(100%);}to{transform:translateY(0);}}
+.modal-handle{width:36px;height:3px;background:var(--border-bright);border-radius:2px;margin:0 auto 14px;}
+.modal-title{
+  font-size:1rem;font-weight:800;margin-bottom:14px;
+  display:flex;align-items:center;gap:8px;
+}
+.modal-dir{font-size:0.72rem;font-weight:700;padding:3px 9px;border-radius:5px;}
+.modal-dir.buy{background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:var(--green);}
+.modal-dir.sell{background:rgba(255,61,90,0.1);border:1px solid rgba(255,61,90,0.3);color:var(--red);}
+.modal-conf{font-size:0.7rem;color:var(--muted);margin-left:auto;}
+.modal-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;}
+.modal-grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;}
+.modal-item{background:rgba(255,255,255,0.025);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;}
+.modal-lbl{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:2px;}
+.modal-val{font-size:0.83rem;font-weight:700;}
+.modal-val.green{color:var(--green);}
+.modal-val.red{color:var(--red);}
+.modal-val.blue{color:var(--blue);}
+.modal-note{
+  font-size:0.73rem;color:var(--muted);margin-bottom:12px;padding:8px 10px;
+  background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:var(--radius-sm);
+  line-height:1.5;
+}
+.modal-actions{display:flex;gap:9px;}
+.btn-cancel{
+  flex:1;padding:10px;background:transparent;border:1px solid var(--border);
+  border-radius:var(--radius-sm);color:var(--muted);font-size:0.82rem;font-weight:700;
+  cursor:pointer;transition:all 0.2s;
+}
+.btn-cancel:hover{border-color:var(--border-bright);color:var(--text);}
+.btn-confirm{
+  flex:2;padding:10px;border:none;border-radius:var(--radius-sm);
+  font-size:0.85rem;font-weight:800;cursor:pointer;transition:all 0.2s;letter-spacing:0.3px;
+}
+.btn-confirm.buy{background:linear-gradient(135deg,#008a45,var(--green));color:#001a0d;}
+.btn-confirm.sell{background:linear-gradient(135deg,#c0002a,var(--red));color:white;}
+.btn-confirm:hover{opacity:0.9;transform:translateY(-1px);}
+.btn-confirm:disabled{opacity:0.4;cursor:not-allowed;transform:none;}
+
+/* ── Toasts ── */
+.toast-container{position:fixed;top:64px;right:16px;z-index:200;display:flex;flex-direction:column;gap:7px;}
+.toast{
+  padding:10px 14px;border-radius:var(--radius-sm);font-size:0.78rem;font-weight:600;
+  border:1px solid;animation:toastIn 0.3s ease;max-width:300px;line-height:1.4;
+}
+.toast.success{background:rgba(0,230,118,0.09);border-color:rgba(0,230,118,0.3);color:var(--green);}
+.toast.error{background:rgba(255,61,90,0.09);border-color:rgba(255,61,90,0.3);color:var(--red);}
+@keyframes toastIn{from{opacity:0;transform:translateX(18px);}to{opacity:1;transform:translateX(0);}}
+
+/* ── Tabs ── */
+.tab-bar{display:flex;align-items:center;gap:4px;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:0;}
+.tab{
+  background:none;border:none;border-bottom:2px solid transparent;
+  color:var(--muted);font-size:0.75rem;font-weight:700;padding:6px 12px;cursor:pointer;
+  transition:color 0.2s,border-color 0.2s;display:flex;align-items:center;gap:6px;
+  text-transform:uppercase;letter-spacing:0.5px;margin-bottom:-1px;
+}
+.tab:hover{color:var(--text);}
+.tab.active{color:var(--blue);border-bottom-color:var(--blue);}
+.trade-count{
+  font-size:0.65rem;padding:1px 6px;border-radius:10px;
+  background:rgba(255,193,7,0.08);border:1px solid rgba(255,193,7,0.2);color:var(--yellow);
+}
+
+/* ── Trade rows ── */
+.trade-row{
+  background:rgba(11,18,32,0.8);border:1px solid var(--border);border-radius:var(--radius);
+  padding:12px 14px;margin-bottom:9px;display:grid;
+  grid-template-columns:auto 1fr auto auto auto auto;
+  align-items:center;gap:12px;
+  animation:cardIn 0.3s ease both;transition:border-color 0.2s;
+}
+.trade-row:hover{border-color:var(--border-bright);}
+.trade-row.profit{border-left:3px solid var(--green);}
+.trade-row.loss{border-left:3px solid var(--red);}
+.tr-dir{font-size:0.72rem;font-weight:800;padding:3px 8px;border-radius:4px;}
+.tr-dir.buy{background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.25);color:var(--green);}
+.tr-dir.sell{background:rgba(255,61,90,0.1);border:1px solid rgba(255,61,90,0.25);color:var(--red);}
+.tr-pair{font-size:0.9rem;font-weight:800;}
+.tr-id{font-size:0.68rem;color:var(--muted);}
+.tr-stat{display:flex;flex-direction:column;gap:1px;align-items:flex-end;}
+.tr-stat .lbl{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;}
+.tr-stat .val{font-size:0.78rem;font-weight:700;font-variant-numeric:tabular-nums;}
+.tr-pnl{font-size:0.88rem;font-weight:800;font-variant-numeric:tabular-nums;}
+.tr-pnl.pos{color:var(--green);}
+.tr-pnl.neg{color:var(--red);}
+.close-btn{
+  font-size:0.68rem;font-weight:700;padding:4px 9px;border-radius:5px;cursor:pointer;
+  background:transparent;border:1px solid var(--border);color:var(--muted);
+  transition:all 0.2s;white-space:nowrap;
+}
+.close-btn:hover{border-color:var(--red);color:var(--red);background:rgba(255,61,90,0.07);}
+.no-trades{color:var(--muted);font-size:0.82rem;padding:32px;text-align:center;}
+
+/* ── Loading / error ── */
+.loading-state{
+  color:var(--muted);font-size:0.82rem;padding:32px 20px;text-align:center;
+  display:flex;flex-direction:column;align-items:center;gap:10px;
+}
+.spinner{
+  width:22px;height:22px;border:2px solid var(--border);
+  border-top-color:var(--blue);border-radius:50%;animation:spin 0.8s linear infinite;
+}
+.error-state{color:var(--red);font-size:0.8rem;padding:16px;}
+</style>
 </head>
 <body>
+
+<!-- Header -->
 <header>
-    <h1>📈 ForexMind</h1>
-    <span class="badge">AI Trading Agent</span>
-    <span id="clock" style="margin-left:auto;color:var(--muted);font-size:0.82rem;"></span>
+  <div class="logo">
+    <div class="logo-icon">📈</div>
+    ForexMind
+  </div>
+  <span class="ai-badge">AI Agent</span>
+  <span id="modeBadge" class="mode-badge paper">● Paper</span>
+  <div class="header-stats">
+    <div class="hstat">
+      <span class="hstat-label">Balance</span>
+      <span class="hstat-value" id="hBalance">—</span>
+    </div>
+    <div class="hstat">
+      <span class="hstat-label">Today P&L</span>
+      <span class="hstat-value" id="hPnl">—</span>
+    </div>
+    <div class="hstat">
+      <span class="hstat-label">Open Trades</span>
+      <span class="hstat-value" id="hOpen">—</span>
+    </div>
+    <div class="hclock" id="clock"></div>
+  </div>
 </header>
-<div class="session-bar" id="sessionBar">
-    <span style="color:var(--text);font-weight:600;">Market Sessions:</span>
-    <span id="sessionPills">Loading...</span>
+
+<!-- Session bar -->
+<div class="session-bar">
+  <span class="session-label">Sessions</span>
+  <span id="sessionPills" style="display:flex;gap:6px;align-items:center;">—</span>
 </div>
+
+<!-- Main -->
 <main>
-    <div class="signals-panel">
-        <div style="display:flex;align-items:center;margin-bottom:12px;">
-            <h2 style="margin:0">Live Signals</h2>
-            <button class="refresh-btn" onclick="refreshSignals(true)">⟳ Refresh</button>
-        </div>
-        <div class="signal-grid" id="signalGrid">
-            <div style="color:var(--muted);font-size:0.85rem;padding:20px;">Loading signals...</div>
-        </div>
+  <div class="signals-panel">
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab active" id="tabSignals" onclick="switchTab('signals')">Signals <span class="signal-count" id="signalCount">—</span></button>
+      <button class="tab" id="tabTrades" onclick="switchTab('trades')">Open Trades <span class="trade-count" id="tradeCount">—</span></button>
+      <button class="refresh-btn" id="refreshBtn" onclick="onRefresh()">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+        Refresh
+      </button>
     </div>
-    <div class="resize-handle" id="resizeHandle"></div>
-    <div class="chat-panel" id="chatPanel">
-        <div class="chat-header">
-            <span>💬</span> Chat with ForexMind
-            <span id="wsStatus" style="margin-left:auto;font-size:0.7rem;color:var(--green);">● Connected</span>
+
+    <!-- Signals view -->
+    <div id="viewSignals">
+      <div class="signal-grid" id="signalGrid">
+        <div class="loading-state" style="grid-column:1/-1">
+          <div class="spinner"></div>Loading signals…
         </div>
-        <div class="quick-actions">
-            <button class="qa-btn" onclick="quickChat('Should I buy EUR/USD?')">EUR/USD signal</button>
-            <button class="qa-btn" onclick="quickChat('What pairs should I trade now?')">Best pairs now</button>
-            <button class="qa-btn" onclick="quickChat('Show my account status')">Account</button>
-            <button class="qa-btn" onclick="quickChat('Is it a good time to trade?')">Market timing</button>
-        </div>
-        <div class="chat-messages" id="chatMessages">
-            <div class="msg agent">👋 Hello! I'm ForexMind — your AI trading analyst. Ask me anything about forex signals, strategies, or market conditions.</div>
-        </div>
-        <div class="typing-indicator" id="typingIndicator" style="display:none;"><span class="spinner"></span> Analysing...</div>
-        <div class="chat-input-row">
-            <input type="text" id="chatInput" class="chat-input" placeholder="Ask about any pair..." onkeydown="handleInputKey(event)" />
-            <button class="chat-send" id="sendBtn" onclick="sendMessage()">Send</button>
-        </div>
+      </div>
     </div>
+
+    <!-- Trades view -->
+    <div id="viewTrades" style="display:none">
+      <div id="tradesList">
+        <div class="loading-state"><div class="spinner"></div>Loading trades…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="resize-handle" id="resizeHandle"></div>
+
+  <div class="chat-panel" id="chatPanel">
+    <div class="chat-header">
+      <span style="font-size:1rem">💬</span>
+      <span class="chat-title">ForexMind AI</span>
+      <div class="ws-status">
+        <div class="ws-dot" id="wsDot"></div>
+        <span id="wsText">Live</span>
+      </div>
+    </div>
+    <div class="quick-actions">
+      <button class="qa-btn" onclick="quickChat('What pairs should I trade right now?')">Best pairs</button>
+      <button class="qa-btn" onclick="quickChat('Show account balance and daily P&L')">Account</button>
+      <button class="qa-btn" onclick="quickChat('Is now a good time to trade?')">Market timing</button>
+      <button class="qa-btn" onclick="quickChat('Explain the GBP/USD setup')">GBP/USD</button>
+    </div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="msg agent">👋 I'm ForexMind — your AI trading analyst. Ask me about signals, strategies, or any pair.</div>
+    </div>
+    <div class="typing-indicator" id="typingIndicator">
+      <div class="typing-dots"><span></span><span></span><span></span></div>
+      Analysing…
+    </div>
+    <div class="chat-input-row">
+      <input type="text" id="chatInput" class="chat-input" placeholder="Ask about any pair…" onkeydown="handleKey(event)">
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
+    </div>
+  </div>
 </main>
+
+<!-- Trade Modal -->
+<div class="modal-overlay" id="tradeModal" onclick="closeModal(event)">
+  <div class="trade-modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span id="mPair">—</span>
+      <span class="modal-dir buy" id="mDir">BUY</span>
+      <span class="modal-conf" id="mConf">—% confidence</span>
+    </div>
+    <div class="modal-grid3">
+      <div class="modal-item">
+        <div class="modal-lbl">Entry</div>
+        <div class="modal-val blue" id="mEntry">—</div>
+      </div>
+      <div class="modal-item">
+        <div class="modal-lbl">Stop Loss</div>
+        <div class="modal-val red" id="mSL">—</div>
+      </div>
+      <div class="modal-item">
+        <div class="modal-lbl">Take Profit</div>
+        <div class="modal-val green" id="mTP">—</div>
+      </div>
+    </div>
+    <div class="modal-grid2">
+      <div class="modal-item">
+        <div class="modal-lbl">R:R Ratio</div>
+        <div class="modal-val" id="mRR">—</div>
+      </div>
+      <div class="modal-item">
+        <div class="modal-lbl">Risk Tier</div>
+        <div class="modal-val blue" id="mRisk">—</div>
+      </div>
+    </div>
+    <div class="modal-note" id="mNote">Position sized by risk manager based on ATR stop distance and account balance.</div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-confirm buy" id="confirmBtn" onclick="confirmTrade()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toasts -->
+<div class="toast-container" id="toasts"></div>
 
 <script>
 const API = '';
 let ws = null;
-let signalTimer = null;
+let _pending = null;
 
-// ── Clock ──────────────────────────────────────────────────────────────────
-function updateClock() {
-    const now = new Date();
-    document.getElementById('clock').textContent =
-        now.toUTCString().replace(' GMT', ' UTC');
+// Clock
+function tick() {
+  const now = new Date();
+  document.getElementById('clock').textContent = now.toUTCString().replace(' GMT',' UTC');
 }
-setInterval(updateClock, 1000);
-updateClock();
+setInterval(tick, 1000); tick();
 
-// ── WebSocket ──────────────────────────────────────────────────────────────
-function connectWS() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${proto}://${location.host}/ws/signals`);
-    ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'signal') updateSignalCard(msg.data);
-        if (msg.type === 'session') updateSessions(msg.data);
-    };
-    ws.onclose = () => {
-        document.getElementById('wsStatus').style.color = 'var(--red)';
-        document.getElementById('wsStatus').textContent = '● Reconnecting...';
-        setTimeout(connectWS, 5000);
-    };
-    ws.onopen = () => {
-        document.getElementById('wsStatus').style.color = 'var(--green)';
-        document.getElementById('wsStatus').textContent = '● Live';
-    };
-    setInterval(() => ws && ws.readyState === 1 && ws.send('ping'), 30000);
+// Account
+async function loadAccount() {
+  try {
+    const d = await fetch(`${API}/api/account`).then(r=>r.json());
+    const bal = d.balance ?? null;
+    const pnl = d.unrealized_pnl ?? d.unrealisedPL ?? null;
+    const open = d.open_trade_count ?? d.openTradeCount ?? null;
+    const paper = d.paper_trading !== false;
+
+    if (bal !== null) document.getElementById('hBalance').textContent = '$'+Number(bal).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    if (pnl !== null) {
+      const n = Number(pnl), el = document.getElementById('hPnl');
+      el.textContent = (n>=0?'+$':'-$')+Math.abs(n).toFixed(2);
+      el.className = 'hstat-value '+(n>=0?'pos':'neg');
+    }
+    if (open !== null) document.getElementById('hOpen').textContent = open;
+    const b = document.getElementById('modeBadge');
+    b.textContent = paper ? '● Paper' : '● Live';
+    b.className = 'mode-badge '+(paper?'paper':'live');
+  } catch(e){}
 }
 
-// ── Sessions ───────────────────────────────────────────────────────────────
+// Sessions
 async function loadSessions() {
-    try {
-        const r = await fetch(`${API}/api/sessions`);
-        const d = await r.json();
-        updateSessions(d);
-    } catch(e) {}
+  try {
+    const d = await fetch(`${API}/api/sessions`).then(r=>r.json());
+    renderSessions(d);
+  } catch(e){}
 }
 
-function updateSessions(data) {
-    const sessions = ['Sydney', 'Tokyo', 'London', 'New York'];
-    let html = sessions.map(s =>
-        `<span class="session-pill ${data.active_sessions?.includes(s) ? 'active' : ''}">${s}</span>`
-    ).join('');
-    if (data.active_overlaps?.length) {
-        html += `<span class="overlap-badge">🔥 ${data.active_overlaps.join(', ')} Overlap</span>`;
-    }
-    document.getElementById('sessionPills').innerHTML = html;
+function renderSessions(data) {
+  const all = ['Sydney','Tokyo','London','New York'];
+  let html = all.map(s =>
+    `<span class="session-pill ${data.active_sessions?.includes(s)?'active':''}">${s}</span>`
+  ).join('');
+  // Overlap names already contain "Overlap" — do NOT append it again
+  if (data.active_overlaps?.length) {
+    data.active_overlaps.forEach(name => {
+      html += `<span class="overlap-badge">🔥 ${name}</span>`;
+    });
+  }
+  document.getElementById('sessionPills').innerHTML = html;
 }
 
-// ── Signals ────────────────────────────────────────────────────────────────
-async function refreshSignals(forceRefresh = false) {
-    document.getElementById('signalGrid').innerHTML =
-        '<div style="color:var(--muted);font-size:0.85rem;padding:20px;">Fetching signals...</div>';
-    try {
-        const url = forceRefresh ? `${API}/api/signals?refresh=true` : `${API}/api/signals`;
-        const r = await fetch(url);
-        const d = await r.json();
-        renderSignals(d.signals || []);
-    } catch(e) {
-        document.getElementById('signalGrid').innerHTML =
-            `<div class="error">Error loading signals: ${e.message}</div>`;
-    }
+// WebSocket
+function connectWS() {
+  const proto = location.protocol==='https:'?'wss':'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/signals`);
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type==='signal') updateCard(msg.data);
+    if (msg.type==='session') renderSessions(msg.data);
+  };
+  ws.onclose = () => { setWS(false); setTimeout(connectWS,5000); };
+  ws.onopen = () => setWS(true);
+  setInterval(()=>ws&&ws.readyState===1&&ws.send('ping'),30000);
+}
+function setWS(on) {
+  document.getElementById('wsDot').className = 'ws-dot'+(on?'':' offline');
+  document.getElementById('wsText').textContent = on?'Live':'Reconnecting…';
+}
+
+// Signals
+async function refreshSignals(force=false) {
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+  document.getElementById('signalGrid').innerHTML =
+    '<div class="loading-state" style="grid-column:1/-1"><div class="spinner"></div>Fetching signals…</div>';
+  try {
+    const d = await fetch(`${API}/api/signals${force?'?refresh=true':''}`).then(r=>r.json());
+    renderSignals(d.signals||[]);
+  } catch(e) {
+    document.getElementById('signalGrid').innerHTML = `<div class="error-state">Failed: ${e.message}</div>`;
+  } finally { btn.classList.remove('spinning'); }
+}
+
+async function silentRefresh() {
+  try {
+    const d = await fetch(`${API}/api/signals`).then(r=>r.json());
+    (d.signals||[]).forEach(s=>{ if(!s.error) updateCard(s); });
+  } catch(e){}
 }
 
 function renderSignals(signals) {
-    const grid = document.getElementById('signalGrid');
-    if (!signals.length) {
-        grid.innerHTML = '<div style="color:var(--muted)">No signals available</div>';
-        return;
-    }
-    grid.innerHTML = signals.map(renderCard).join('');
+  document.getElementById('signalCount').textContent = `${signals.length} pairs`;
+  const grid = document.getElementById('signalGrid');
+  if (!signals.length) {
+    grid.innerHTML = '<div class="loading-state" style="grid-column:1/-1">No signals available</div>';
+    return;
+  }
+  grid.innerHTML = signals.map(renderCard).join('');
+  triggerBars(grid);
 }
 
-async function silentRefreshSignals() {
-    // Updates signal cards in-place without clearing the grid (no loading flash)
-    try {
-        const r = await fetch(`${API}/api/signals`);
-        const d = await r.json();
-        (d.signals || []).forEach(s => {
-            if (!s.error) updateSignalCard(s);
-        });
-    } catch(e) {}
+function triggerBars(root) {
+  requestAnimationFrame(()=>{
+    (root||document).querySelectorAll('.conf-bar-fill[data-t]').forEach(el=>{
+      el.style.width = el.dataset.t+'%';
+    });
+  });
 }
 
 function fmtMacd(v) {
-    if (v === 'bull_cross') return '🔼 Bull';
-    if (v === 'bear_cross') return '🔽 Bear';
-    return '—';
+  if (v==='bull_cross') return '🔼 Bull';
+  if (v==='bear_cross') return '🔽 Bear';
+  return '—';
+}
+
+function safeJSON(obj) {
+  return JSON.stringify(obj).replace(/'/g,"&#39;").replace(/"/g,'&quot;');
 }
 
 function renderCard(s) {
-    if (s.error) return `<div class="signal-card"><div class="pair">${s.instrument}</div><div class="error">${s.error}</div></div>`;
-    const sig = s.signal || {};
-    const ind = s.indicators || {};
-    const rawAction = (sig.action || 'HOLD').toUpperCase();
-    const conf = sig.confidence || 0;
-    const pair = (s.instrument || '').replace('_', '/');
-
-    // Weak = BUY/SELL but below auto-trade threshold (55%)
-    const isTradeable = conf >= 55 && rawAction !== 'HOLD';
-    const cardClass = rawAction === 'HOLD' ? 'hold' : (isTradeable ? rawAction.toLowerCase() : 'weak');
-    const badgeLabel = rawAction === 'HOLD' ? 'HOLD' : (isTradeable ? rawAction : `${rawAction} ⚠️`);
-
-    const sl = sig.stop_loss > 0 ? sig.stop_loss.toFixed(5) : '—';
-    const tp = sig.take_profit > 0 ? sig.take_profit.toFixed(5) : '—';
-    const rr = rawAction !== 'HOLD' && sig.risk_reward ? `${sig.risk_reward}:1` : '—';
-
-    return `
-    <div class="signal-card ${cardClass}" data-pair="${s.instrument}" onclick="quickChat('Give me full details on ${s.instrument}')">
-        <div class="signal-header">
-            <span class="pair">${pair}</span>
-            <span class="action-badge ${cardClass}">${badgeLabel}</span>
-            ${s.m15_aligned ? '<span style="font-size:0.7rem;color:var(--green);margin-left:4px;">✅ H1+M15</span>' : ''}
-        </div>
-        <div class="signal-row">
-            <div class="signal-item"><div class="label">Entry</div>${sig.entry > 0 ? sig.entry.toFixed(5) : '—'}</div>
-            <div class="signal-item"><div class="label">Confidence</div>${conf}%</div>
-            <div class="signal-item"><div class="label">Stop Loss</div><span style="color:var(--red)">${sl}</span></div>
-            <div class="signal-item"><div class="label">Take Profit</div><span style="color:var(--green)">${tp}</span></div>
-            <div class="signal-item"><div class="label">R:R</div>${rr}</div>
-            <div class="signal-item"><div class="label">RSI</div>${ind.rsi || '—'}</div>
-            <div class="signal-item"><div class="label">ADX</div>${ind.adx || '—'}</div>
-            <div class="signal-item"><div class="label">MACD</div>${fmtMacd(ind.macd_cross)}</div>
-        </div>
-        <div class="confidence-bar"><div class="confidence-fill ${cardClass}" style="width:${Math.min(conf, 100)}%"></div></div>
+  if (s.error) return `
+    <div class="signal-card hold" data-pair="${s.instrument||''}">
+      <div class="card-header">
+        <span class="pair-name">${(s.instrument||'').replace('_','/')}</span>
+        <span class="action-badge hold">ERR</span>
+      </div>
+      <div class="error-state">${s.error}</div>
     </div>`;
+
+  const sig = s.signal||{}, ind = s.indicators||{};
+  const action = (sig.action||'HOLD').toUpperCase();
+  const conf = Number(sig.confidence||0);
+  const pair = (s.instrument||'').replace('_','/');
+  const tradeable = conf>=62 && action!=='HOLD';
+  const cls = action==='HOLD'?'hold':(tradeable?action.toLowerCase():'hold');
+
+  const sl = sig.stop_loss>0 ? Number(sig.stop_loss).toFixed(5) : '—';
+  const tp = sig.take_profit>0 ? Number(sig.take_profit).toFixed(5) : '—';
+  const entry = sig.entry>0 ? Number(sig.entry).toFixed(5) : '—';
+  const rr = sig.risk_reward ? `${sig.risk_reward}:1` : '—';
+  const agreeing = parseInt(sig.agreeing_strategies||0, 10) || 0;
+
+  const strats = ['Rule','LGBM','LSTM','RL'];
+  const dots = strats.map((n,i)=>`<div class="strat-dot ${i<agreeing?`agree-${cls}`:''}" title="${n}"></div>`).join('');
+
+  const sigData = {
+    instrument: s.instrument,
+    direction: action,
+    entry: sig.entry||0,
+    stop_loss: sig.stop_loss||0,
+    take_profit: sig.take_profit||0,
+    atr: ind.atr||0.0005,
+    confidence: conf/100,
+    risk_reward: sig.risk_reward||2,
+  };
+
+  return `
+<div class="signal-card ${cls}" data-pair="${s.instrument}" data-sig="${safeJSON(sigData)}">
+  <div class="card-header">
+    <span class="pair-name">${pair}</span>
+    <div class="card-badges">
+      ${s.m15_aligned?'<span class="align-badge">✅ H1+M15</span>':''}
+      <span class="action-badge ${cls}">${action}</span>
+    </div>
+  </div>
+  <div class="conf-row">
+    <div class="conf-bar-wrap"><div class="conf-bar-fill ${cls}" data-t="${Math.min(conf,100)}" style="width:0%"></div></div>
+    <span class="conf-pct ${cls}">${conf}%</span>
+  </div>
+  <div class="signal-data">
+    <div class="sd-item"><div class="sd-lbl">Entry</div><div class="sd-val">${entry}</div></div>
+    <div class="sd-item"><div class="sd-lbl">R:R</div><div class="sd-val">${rr}</div></div>
+    <div class="sd-item"><div class="sd-lbl">Stop Loss</div><div class="sd-val red">${sl}</div></div>
+    <div class="sd-item"><div class="sd-lbl">Take Profit</div><div class="sd-val green">${tp}</div></div>
+    <div class="sd-item"><div class="sd-lbl">RSI</div><div class="sd-val">${ind.rsi||'—'}</div></div>
+    <div class="sd-item"><div class="sd-lbl">ADX</div><div class="sd-val">${ind.adx||'—'}</div></div>
+    <div class="sd-item"><div class="sd-lbl">MACD</div><div class="sd-val">${fmtMacd(ind.macd_cross)}</div></div>
+    <div class="sd-item"><div class="sd-lbl">EMA Trend</div><div class="sd-val">${ind.ema_trend||'—'}</div></div>
+  </div>
+  <div class="card-footer">
+    <div style="display:flex;align-items:center;gap:5px">
+      <div class="strat-dots">${dots}</div>
+      <span class="strat-lbl">${isNaN(agreeing)?0:agreeing}/4 agree</span>
+    </div>
+    ${tradeable
+      ? `<button class="trade-btn ${cls}" onclick="openModal(event,'${s.instrument}')">Trade ${action}</button>`
+      : `<span class="below-threshold">Below threshold</span>`}
+  </div>
+</div>`;
 }
 
-function updateSignalCard(data) {
-    const pair = data.instrument;
-    const grid = document.getElementById('signalGrid');
-    const existing = grid.querySelector(`[data-pair="${pair}"]`);
-    const card = renderCard(data);
-    if (existing) existing.outerHTML = card;
-    else grid.insertAdjacentHTML('afterbegin', card);
+function updateCard(data) {
+  const grid = document.getElementById('signalGrid');
+  const existing = grid.querySelector(`[data-pair="${data.instrument}"]`);
+  const html = renderCard(data);
+  if (existing) {
+    const tmp = document.createElement('div'); tmp.innerHTML = html;
+    const card = tmp.firstElementChild;
+    existing.replaceWith(card);
+    triggerBars(card);
+  } else {
+    grid.insertAdjacentHTML('afterbegin', html);
+    const card = grid.querySelector(`[data-pair="${data.instrument}"]`);
+    if (card) triggerBars(card);
+  }
 }
 
-// ── Chat ───────────────────────────────────────────────────────────────────
-function quickChat(msg) {
-    const input = document.getElementById('chatInput');
-    input.value = msg;
-    input.focus();
-    sendMessage();
+// Trade Modal
+function openModal(event, instrument) {
+  event.stopPropagation();
+  const card = document.querySelector(`[data-pair="${instrument}"]`);
+  if (!card) return;
+  let sig = {};
+  try { sig = JSON.parse(card.dataset.sig.replace(/&quot;/g,'"').replace(/&#39;/g,"'")); } catch(e){}
+
+  _pending = sig;
+  const pair = instrument.replace('_','/');
+  const cls = sig.direction.toLowerCase();
+  const conf = Math.round(sig.confidence*100);
+  const riskTier = conf>=85?'5%':conf>=75?'4%':conf>=65?'3%':'2%';
+
+  document.getElementById('mPair').textContent = pair;
+  const d = document.getElementById('mDir');
+  d.textContent = sig.direction; d.className = `modal-dir ${cls}`;
+  document.getElementById('mConf').textContent = `${conf}% confidence`;
+  document.getElementById('mEntry').textContent = sig.entry>0 ? Number(sig.entry).toFixed(5) : '—';
+  document.getElementById('mSL').textContent = sig.stop_loss>0 ? Number(sig.stop_loss).toFixed(5) : '—';
+  document.getElementById('mTP').textContent = sig.take_profit>0 ? Number(sig.take_profit).toFixed(5) : '—';
+  document.getElementById('mRR').textContent = sig.risk_reward ? `${sig.risk_reward}:1` : '—';
+  document.getElementById('mRisk').textContent = riskTier;
+  document.getElementById('mNote').textContent = `Risk manager will size this ${sig.direction} at ${riskTier} of balance. Stop and target are ATR-derived.`;
+
+  const btn = document.getElementById('confirmBtn');
+  btn.className = `btn-confirm ${cls}`;
+  btn.textContent = `Confirm ${sig.direction}`;
+
+  document.getElementById('tradeModal').classList.add('open');
 }
 
-function handleInputKey(e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+function closeModal(event) {
+  if (!event || event.target.id==='tradeModal') {
+    document.getElementById('tradeModal').classList.remove('open');
+    _pending = null;
+  }
 }
+
+async function confirmTrade() {
+  if (!_pending) return;
+  const btn = document.getElementById('confirmBtn');
+  btn.disabled = true; btn.textContent = 'Placing…';
+  try {
+    const r = await fetch(`${API}/api/trade`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(_pending),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      toast('error', `Trade failed: ${data.error||data.detail||'Unknown error'}`);
+    } else {
+      const pair = _pending.instrument.replace('_','/');
+      toast('success', `✅ ${_pending.direction} ${pair} — ${(data.units||0).toLocaleString()} units @ ${Number(data.filled_price||0).toFixed(5)} | Risk ${(data.risk_pct||0).toFixed(1)}%`);
+      document.getElementById('tradeModal').classList.remove('open');
+      loadAccount();
+    }
+  } catch(e) { toast('error', `Error: ${e.message}`); }
+  finally {
+    btn.disabled = false;
+    btn.textContent = `Confirm ${_pending?.direction||''}`;
+    _pending = null;
+  }
+}
+
+function toast(type, msg) {
+  const c = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`; el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity 0.3s'; setTimeout(()=>el.remove(),300); }, 5000);
+}
+
+// Chat
+function quickChat(msg) { document.getElementById('chatInput').value=msg; sendMessage(); }
+function handleKey(e) { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();} }
 
 async function sendMessage() {
-    const input = document.getElementById('chatInput');
-    const msg = input.value.trim();
-    if (!msg) return;
-    input.value = '';
-
-    appendMessage('user', msg);
-    const btn = document.getElementById('sendBtn');
-    btn.disabled = true;
-    document.getElementById('typingIndicator').style.display = 'flex';
-
-    const msgs = document.getElementById('chatMessages');
-    let agentDiv = null;
-    let fullText = '';
-
-    try {
-        const r = await fetch(`${API}/api/chat/stream`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({message: msg}),
-        });
-
-        let firstToken = true;
-        const reader = r.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const parts = buffer.split('\n\n');
-            buffer = parts.pop();
-            for (const part of parts) {
-                if (!part.startsWith('data: ')) continue;
-                const raw = part.slice(6).trim();
-                if (raw === '[DONE]') break;
-                try {
-                    const parsed = JSON.parse(raw);
-                    if (parsed.error) {
-                        if (!agentDiv) { agentDiv = document.createElement('div'); agentDiv.className = 'msg agent'; msgs.appendChild(agentDiv); }
-                        agentDiv.innerHTML = `⚠️ ${parsed.error}`;
-                        break;
-                    }
-                    if (parsed.text) {
-                        if (firstToken) {
-                            document.getElementById('typingIndicator').style.display = 'none';
-                            agentDiv = document.createElement('div');
-                            agentDiv.className = 'msg agent';
-                            msgs.appendChild(agentDiv);
-                            firstToken = false;
-                        }
-                        fullText += parsed.text;
-                        agentDiv.innerHTML = fullText
-                            .replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
-                            .replace(/\n/g, '<br>')
-                            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-                        msgs.scrollTop = msgs.scrollHeight;
-                    }
-                } catch(_) {}
-            }
-        }
-    } catch(e) {
-        agentDiv.innerHTML = `⚠️ Error: ${e.message}`;
-    } finally {
-        btn.disabled = false;
-        document.getElementById('typingIndicator').style.display = 'none';
-        input.focus();
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim(); if (!msg) return;
+  input.value = '';
+  appendMsg('user', msg);
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  document.getElementById('typingIndicator').style.display = 'flex';
+  const msgs = document.getElementById('chatMessages');
+  let div = null; let text = '';
+  // Helper: create the agent reply bubble if not already created
+  const ensureDiv = () => { if(!div){document.getElementById('typingIndicator').style.display='none';div=mkAgentMsg();} return div; };
+  try {
+    const r = await fetch(`${API}/api/chat/stream`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg}),
+    });
+    // Non-2xx: read error body and show it
+    if(!r.ok){
+      const errText = await r.text().catch(()=>'Unknown server error');
+      let detail = errText;
+      try { detail = JSON.parse(errText).detail || errText; } catch(_){}
+      ensureDiv().innerHTML = `⚠️ Server error ${r.status}: ${detail.slice(0,200)}`;
+      return;
     }
-}
-
-function appendMessage(role, text) {
-    const msgs = document.getElementById('chatMessages');
-    const div = document.createElement('div');
-    div.className = `msg ${role}`;
-    if (role === 'agent') {
-        div.innerHTML = text.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
-            .replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-    } else {
-        div.textContent = text;
+    let buf='';
+    const reader=r.body.getReader(), dec=new TextDecoder();
+    while(true){
+      const {done,value}=await reader.read(); if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\n\n'); buf=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data: '))continue;
+        const raw=p.slice(6).trim(); if(raw==='[DONE]')break;
+        try{
+          const j=JSON.parse(raw);
+          if(j.error){ ensureDiv().innerHTML=`⚠️ ${j.error}`; break; }
+          if(j.text){
+            text+=j.text;
+            ensureDiv().innerHTML=fmtText(text);
+            msgs.scrollTop=msgs.scrollHeight;
+          }
+        }catch(_){}
+      }
     }
-    msgs.appendChild(div);
-    msgs.scrollTop = msgs.scrollHeight;
+    // If stream completed but nothing was shown (empty response)
+    if(!text) ensureDiv().innerHTML='⚠️ No response received. Check server logs.';
+  }catch(e){
+    ensureDiv().innerHTML=`⚠️ ${e.message}`;
+  }finally{
+    btn.disabled=false;
+    document.getElementById('typingIndicator').style.display='none';
+    input.focus();
+  }
 }
 
-function appendSignalSummary(sig) {
-    const action = sig.action;
-    const colour = action === 'BUY' ? 'var(--green)' : action === 'SELL' ? 'var(--red)' : 'var(--muted)';
-    const msgs = document.getElementById('chatMessages');
-    const div = document.createElement('div');
-    div.className = 'msg agent';
-    div.innerHTML = `
-        <div style="border:1px solid ${colour};border-radius:6px;padding:8px;margin-bottom:4px;">
-            <strong style="color:${colour}">${action} ${sig.instrument}</strong><br>
-            Entry: ${sig.entry} &nbsp;|&nbsp; SL: <span style="color:var(--red)">${sig.stop_loss}</span> &nbsp;|&nbsp; TP: <span style="color:var(--green)">${sig.take_profit}</span><br>
-            R:R ${sig.risk_reward}:1 &nbsp;|&nbsp; Confidence: ${sig.confidence}%
-        </div>`;
-    msgs.appendChild(div);
+function mkAgentMsg(){
+  const msgs=document.getElementById('chatMessages');
+  const div=document.createElement('div'); div.className='msg agent';
+  msgs.appendChild(div); msgs.scrollTop=msgs.scrollHeight; return div;
+}
+function appendMsg(role,text){
+  const msgs=document.getElementById('chatMessages');
+  const div=document.createElement('div'); div.className=`msg ${role}`; div.textContent=text;
+  msgs.appendChild(div); msgs.scrollTop=msgs.scrollHeight;
+}
+function fmtText(t){
+  return t.replace(/```([\s\S]*?)```/g,'<pre>$1</pre>')
+          .replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>')
+          .replace(/\n/g,'<br>');
 }
 
-// ── Resizable divider ──────────────────────────────────────────────────────
-(function() {
-    const handle = document.getElementById('resizeHandle');
-    const chatPanel = document.getElementById('chatPanel');
-    let dragging = false;
-    let startX = 0;
-    let startWidth = 0;
+// Tabs
+let activeTab = 'signals';
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('viewSignals').style.display = tab==='signals'?'':'none';
+  document.getElementById('viewTrades').style.display = tab==='trades'?'':'none';
+  document.getElementById('tabSignals').className = 'tab'+(tab==='signals'?' active':'');
+  document.getElementById('tabTrades').className = 'tab'+(tab==='trades'?' active':'');
+  if (tab==='trades') loadTrades();
+}
+function onRefresh() {
+  if (activeTab==='signals') refreshSignals(true);
+  else loadTrades(true);
+}
 
-    handle.addEventListener('mousedown', (e) => {
-        dragging = true;
-        startX = e.clientX;
-        startWidth = chatPanel.offsetWidth;
-        handle.classList.add('dragging');
-        document.body.style.cursor = 'col-resize';
-        document.body.style.userSelect = 'none';
-        e.preventDefault();
-    });
+// Trades
+async function loadTrades(showLoading=false) {
+  if (showLoading) document.getElementById('tradesList').innerHTML = '<div class="loading-state"><div class="spinner"></div>Loading trades…</div>';
+  try {
+    const d = await fetch(`${API}/api/trades`).then(r=>r.json());
+    const trades = d.trades||[];
+    document.getElementById('tradeCount').textContent = trades.length||'0';
+    renderTrades(trades);
+  } catch(e) {
+    document.getElementById('tradesList').innerHTML = `<div class="error-state">Failed: ${e.message}</div>`;
+  }
+}
 
-    document.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        // Dragging left increases chat width, right decreases it
-        const delta = startX - e.clientX;
-        const newWidth = Math.max(260, Math.min(window.innerWidth - 300, startWidth + delta));
-        chatPanel.style.width = newWidth + 'px';
-    });
+function renderTrades(trades) {
+  const el = document.getElementById('tradesList');
+  if (!trades.length) {
+    el.innerHTML = '<div class="no-trades">No open trades</div>';
+    return;
+  }
+  el.innerHTML = trades.map(t => {
+    const dir = (t.currentUnits||t.initialUnits||0) > 0 ? 'BUY' : 'SELL';
+    const pnl = parseFloat(t.unrealizedPL||0);
+    const pair = (t.instrument||'').replace('_','/');
+    const units = Math.abs(parseInt(t.currentUnits||t.initialUnits||0));
+    const entry = parseFloat(t.price||0).toFixed(5);
+    const sl = t.stopLossOrder ? parseFloat(t.stopLossOrder.price).toFixed(5) : '—';
+    const tp = t.takeProfitOrder ? parseFloat(t.takeProfitOrder.price).toFixed(5) : '—';
+    const tradeId = t.id||'?';
+    return `
+<div class="trade-row ${pnl>=0?'profit':'loss'}" data-id="${tradeId}">
+  <span class="tr-dir ${dir.toLowerCase()}">${dir}</span>
+  <div>
+    <div class="tr-pair">${pair}</div>
+    <div class="tr-id">#${tradeId} · ${units.toLocaleString()} units</div>
+  </div>
+  <div class="tr-stat"><span class="lbl">Entry</span><span class="val">${entry}</span></div>
+  <div class="tr-stat"><span class="lbl">SL</span><span class="val" style="color:var(--red)">${sl}</span></div>
+  <div class="tr-stat"><span class="lbl">TP</span><span class="val" style="color:var(--green)">${tp}</span></div>
+  <div>
+    <div class="tr-pnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}\$${Math.abs(pnl).toFixed(2)}</div>
+    <button class="close-btn" onclick="closeTrade('${tradeId}','${pair}')">Close</button>
+  </div>
+</div>`;
+  }).join('');
+}
 
-    document.addEventListener('mouseup', () => {
-        if (!dragging) return;
-        dragging = false;
-        handle.classList.remove('dragging');
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-    });
+async function closeTrade(id, pair) {
+  if (!confirm(`Close ${pair} trade #${id}?`)) return;
+  try {
+    const r = await fetch(`${API}/api/trades/${id}/close`, {method:'POST'});
+    const d = await r.json();
+    if (!r.ok || d.error) { toast('error', `Close failed: ${d.error||d.detail}`); return; }
+    toast('success', `✅ Closed ${pair} #${id} | P&L: ${d.realized_pnl!=null?(d.realized_pnl>=0?'+':'')+'\$'+Math.abs(d.realized_pnl).toFixed(2):'—'}`);
+    loadTrades(); loadAccount();
+  } catch(e) { toast('error', `Error: ${e.message}`); }
+}
+
+// Resize
+(function(){
+  const h=document.getElementById('resizeHandle'),p=document.getElementById('chatPanel');
+  let drag=false,sx=0,sw=0;
+  h.addEventListener('mousedown',e=>{drag=true;sx=e.clientX;sw=p.offsetWidth;h.classList.add('dragging');document.body.style.cssText='cursor:col-resize;user-select:none';e.preventDefault();});
+  document.addEventListener('mousemove',e=>{if(!drag)return;p.style.width=Math.max(240,Math.min(window.innerWidth-300,sw+(sx-e.clientX)))+'px';});
+  document.addEventListener('mouseup',()=>{if(!drag)return;drag=false;h.classList.remove('dragging');document.body.style.cssText='';});
 })();
 
-// ── Init ───────────────────────────────────────────────────────────────────
-loadSessions();
-refreshSignals();
-connectWS();
-setInterval(loadSessions, 60000);
-setInterval(silentRefreshSignals, 90000);  // Refresh signals every 90s without clearing grid
+// Init
+loadAccount(); loadSessions(); refreshSignals(); connectWS();
+// Poll trade count badge every 30s
+async function pollTradeCount() {
+  try {
+    const d = await fetch(`${API}/api/trades`).then(r=>r.json());
+    document.getElementById('tradeCount').textContent = (d.trades||[]).length||'0';
+    document.getElementById('hOpen').textContent = (d.trades||[]).length||'0';
+    if (activeTab==='trades') renderTrades(d.trades||[]);
+  } catch(e){}
+}
+pollTradeCount();
+setInterval(loadAccount,30000);
+setInterval(loadSessions,60000);
+setInterval(silentRefresh,90000);
+setInterval(pollTradeCount,15000);
 </script>
 </body>
 </html>

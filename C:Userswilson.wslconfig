@@ -1,0 +1,5 @@
+[wsl2]
+swap=4GB
+
+[experimental]
+autoMemoryReclaim=disabled

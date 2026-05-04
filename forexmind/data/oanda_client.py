@@ -102,6 +102,8 @@ def retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """
     Decorator for retrying a coroutine on transient errors.
     Implements exponential backoff: delay, delay*backoff, delay*backoff^2, ...
+    On ConnectionError / RemoteDisconnected, recreates the OANDA client before
+    retrying so stale HTTP connections don't persist.
     """
     def decorator(fn: F) -> F:
         @wraps(fn)
@@ -113,6 +115,23 @@ def retry(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
                 except Exception as e:
                     if attempt == max_attempts:
                         raise
+                    err_str = str(e).lower()
+                    is_connection_err = any(k in err_str for k in (
+                        "connection aborted", "remotedisconnected",
+                        "connection reset", "broken pipe", "connection refused",
+                    ))
+                    # Recreate the underlying OANDA API client on connection errors
+                    # so stale pooled connections are discarded before the retry.
+                    if is_connection_err and args and hasattr(args[0], "_client"):
+                        try:
+                            cfg = args[0]._cfg
+                            args[0]._client = OandaAPI(
+                                access_token=cfg.api_key,
+                                environment=cfg.environment,
+                            )
+                            log.info(f"[{fn.__name__}] Reconnected OANDA client after connection error")
+                        except Exception:
+                            pass
                     log.warning(
                         f"[{fn.__name__}] attempt {attempt}/{max_attempts} failed: {e}. "
                         f"Retrying in {current_delay:.1f}s..."
@@ -234,33 +253,75 @@ class OandaClient:
         }
 
         if from_dt and to_dt:
-            params["from"] = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            params["to"] = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Paginate: OANDA max is 5000 candles per request.
+            # For long date ranges (e.g. full year H1 = ~6500 candles) we split
+            # into multiple requests and concatenate.
+            from datetime import timedelta
+            PAGE_SIZE = 4500  # stay safely under 5000 limit
+            all_rows: list[dict] = []
+            cursor = from_dt
+            while cursor < to_dt:
+                page_params = {
+                    "granularity": gran,
+                    "price": "M",
+                    "from": cursor.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "count": PAGE_SIZE,
+                }
+                req = instruments.InstrumentsCandles(instrument, params=page_params)
+                page_data = await asyncio.to_thread(self._client.request, req)
+                page_candles = page_data.get("candles", [])
+                if not page_candles:
+                    break
+                for candle in page_candles:
+                    ts = pd.Timestamp(candle["time"]).tz_convert("UTC")
+                    if ts >= to_dt:
+                        break
+                    if not candle.get("complete", True):
+                        continue
+                    mid = candle["mid"]
+                    all_rows.append({
+                        "time": ts,
+                        "open": float(mid["o"]),
+                        "high": float(mid["h"]),
+                        "low": float(mid["l"]),
+                        "close": float(mid["c"]),
+                        "volume": int(candle.get("volume", 0)),
+                    })
+                # Advance cursor to last candle time + 1 second
+                last_ts = pd.Timestamp(page_candles[-1]["time"]).tz_convert("UTC")
+                if last_ts <= cursor:
+                    break  # No progress — stop
+                cursor = last_ts.to_pydatetime() + timedelta(seconds=1)
+                if len(page_candles) < PAGE_SIZE:
+                    break  # Last page
+                await asyncio.sleep(0.3)  # Respect rate limits between pages
+
+            rows = all_rows
         else:
             params["count"] = min(count, 5000)
-
-        request = instruments.InstrumentsCandles(instrument, params=params)
-        data = await asyncio.to_thread(self._client.request, request)
-
-        rows = []
-        for candle in data.get("candles", []):
-            if not candle.get("complete", True):
-                continue   # Skip the in-progress (unclosed) candle
-            mid = candle["mid"]
-            rows.append({
-                "time": pd.Timestamp(candle["time"]).tz_convert("UTC"),
-                "open": float(mid["o"]),
-                "high": float(mid["h"]),
-                "low": float(mid["l"]),
-                "close": float(mid["c"]),
-                "volume": int(candle.get("volume", 0)),
-            })
+            request = instruments.InstrumentsCandles(instrument, params=params)
+            data = await asyncio.to_thread(self._client.request, request)
+            rows = []
+            for candle in data.get("candles", []):
+                if not candle.get("complete", True):
+                    continue
+                mid = candle["mid"]
+                rows.append({
+                    "time": pd.Timestamp(candle["time"]).tz_convert("UTC"),
+                    "open": float(mid["o"]),
+                    "high": float(mid["h"]),
+                    "low": float(mid["l"]),
+                    "close": float(mid["c"]),
+                    "volume": int(candle.get("volume", 0)),
+                })
 
         if not rows:
             log.warning(f"No candles returned for {instrument} {granularity}")
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
         df = pd.DataFrame(rows).set_index("time").sort_index()
+        # Deduplicate in case pages overlapped
+        df = df[~df.index.duplicated(keep="last")]
         log.debug(f"Fetched {len(df)} {granularity} candles for {instrument}")
         return df
 
@@ -306,14 +367,16 @@ class OandaClient:
             }
         }
 
+        # Decimal places per instrument type: JPY=3, metals (XAU/XAG)=2, others=5
+        price_decimals = 3 if "JPY" in instrument else (2 if instrument.startswith(("XAU", "XAG")) else 5)
         if stop_loss is not None:
             order_data["order"]["stopLossOnFill"] = {
-                "price": f"{stop_loss:.5f}",
+                "price": f"{stop_loss:.{price_decimals}f}",
                 "timeInForce": "GTC",
             }
         if take_profit is not None:
             order_data["order"]["takeProfitOnFill"] = {
-                "price": f"{take_profit:.5f}",
+                "price": f"{take_profit:.{price_decimals}f}",
                 "timeInForce": "GTC",
             }
 
@@ -322,17 +385,50 @@ class OandaClient:
             data = await asyncio.to_thread(self._client.request, request)
 
             fill = data.get("orderFillTransaction", {})
+            trade_id = fill.get("tradeOpened", {}).get("tradeID", "")
+            filled_price = float(fill.get("price", 0))
+
+            # Fallback: if OANDA omitted tradeOpened (e.g. adding to existing
+            # position), scan relatedTransactionIDs for the trade ID and if
+            # still missing, fetch open trades and pick the newest for this
+            # instrument.
+            if not trade_id:
+                # relatedTransactionIDs sometimes contains the trade ID directly
+                related = data.get("relatedTransactionIDs", [])
+                if related:
+                    trade_id = related[-1]
+                    log.debug(f"trade_id from relatedTransactionIDs: {trade_id}")
+
+            if not trade_id:
+                try:
+                    req2 = trades_ep.TradesList(
+                        self._cfg.account_id,
+                        params={"state": "OPEN", "instrument": instrument},
+                    )
+                    resp2 = await asyncio.to_thread(self._client.request, req2)
+                    open_list = resp2.get("trades", [])
+                    if open_list:
+                        # Most recently opened trade is first
+                        trade_id = str(open_list[0].get("id", ""))
+                        if not filled_price:
+                            filled_price = float(open_list[0].get("price", 0))
+                        log.info(f"trade_id resolved via open trades fallback: {trade_id}")
+                except Exception as fe:
+                    log.warning(f"trade_id fallback fetch failed: {fe}")
+
+            log.debug(f"market_order response keys: {list(data.keys())}; fill keys: {list(fill.keys())}")
             return OrderResult(
                 success=True,
-                trade_id=fill.get("tradeOpened", {}).get("tradeID", ""),
+                trade_id=trade_id,
                 order_id=fill.get("orderID", ""),
-                filled_price=float(fill.get("price", 0)),
+                filled_price=filled_price,
                 units=abs(units),
             )
         except V20Error as e:
             log.error(f"OANDA order failed: {e}")
             return OrderResult(success=False, message=str(e))
 
+    @retry(max_attempts=3)
     async def close_trade(self, trade_id: str) -> OrderResult:
         """Close an open trade by its OANDA trade ID."""
         try:
@@ -348,6 +444,76 @@ class OandaClient:
             log.error(f"OANDA close_trade failed: {e}")
             return OrderResult(success=False, message=str(e))
 
+    @retry(max_attempts=3)
+    async def partial_close_trade(self, trade_id: str, units: int) -> OrderResult:
+        """
+        Partially close a trade by closing `units` of its position.
+        units must be positive; the direction is inferred from the open trade.
+        """
+        try:
+            request = trades_ep.TradeClose(
+                self._cfg.account_id,
+                tradeID=trade_id,
+                data={"units": str(abs(units))},
+            )
+            data = await asyncio.to_thread(self._client.request, request)
+            fill = data.get("orderFillTransaction", {})
+            return OrderResult(
+                success=True,
+                trade_id=trade_id,
+                filled_price=float(fill.get("price", 0)),
+                units=abs(units),
+            )
+        except V20Error as e:
+            log.error(f"partial_close_trade failed: {e}")
+            return OrderResult(success=False, message=str(e))
+
+    @retry(max_attempts=3)
+    async def modify_trade_sl(self, trade_id: str, new_sl: float, instrument: str = "") -> bool:
+        """Move the stop-loss of an open trade to new_sl."""
+        try:
+            price_decimals = 3 if "JPY" in instrument else (2 if instrument.startswith(("XAU", "XAG")) else 5)
+            data = {
+                "stopLoss": {
+                    "price": f"{new_sl:.{price_decimals}f}",
+                    "timeInForce": "GTC",
+                }
+            }
+            request = trades_ep.TradeCRCDO(
+                self._cfg.account_id,
+                tradeID=trade_id,
+                data=data,
+            )
+            await asyncio.to_thread(self._client.request, request)
+            log.info(f"Trade {trade_id} SL moved to {new_sl:.{price_decimals}f}")
+            return True
+        except V20Error as e:
+            log.error(f"modify_trade_sl failed: {e}")
+            return False
+
+    async def modify_trade_tp(self, trade_id: str, new_tp: float, instrument: str = "") -> bool:
+        """Move the take-profit of an open trade to new_tp."""
+        try:
+            price_decimals = 3 if "JPY" in instrument else (2 if instrument.startswith(("XAU", "XAG")) else 5)
+            data = {
+                "takeProfit": {
+                    "price": f"{new_tp:.{price_decimals}f}",
+                    "timeInForce": "GTC",
+                }
+            }
+            request = trades_ep.TradeCRCDO(
+                self._cfg.account_id,
+                tradeID=trade_id,
+                data=data,
+            )
+            await asyncio.to_thread(self._client.request, request)
+            log.info(f"Trade {trade_id} TP moved to {new_tp:.{price_decimals}f}")
+            return True
+        except V20Error as e:
+            log.error(f"modify_trade_tp failed: {e}")
+            return False
+
+    @retry(max_attempts=3)
     async def get_open_positions(self) -> list[dict[str, Any]]:
         """Return a list of currently open positions."""
         request = positions.PositionList(self._cfg.account_id)
@@ -356,11 +522,74 @@ class OandaClient:
                 float(p.get("long", {}).get("units", 0)) != 0
                 or float(p.get("short", {}).get("units", 0)) != 0]
 
+    @retry(max_attempts=3)
     async def get_open_trades(self) -> list[dict[str, Any]]:
         """Return open trades with individual trade IDs (required for closing)."""
         request = trades_ep.TradesList(self._cfg.account_id, params={"state": "OPEN"})
         data = await asyncio.to_thread(self._client.request, request)
         return data.get("trades", [])
+
+    @retry(max_attempts=3)
+    async def get_recently_closed_trades(self, count: int = 50) -> list[dict[str, Any]]:
+        """Return the most recent closed trades (SL/TP hits and manual closes)."""
+        request = trades_ep.TradesList(
+            self._cfg.account_id,
+            params={"state": "CLOSED", "count": str(count)},
+        )
+        data = await asyncio.to_thread(self._client.request, request)
+        return data.get("trades", [])
+
+    async def get_retail_sentiment(self, instrument: str) -> dict[str, Any]:
+        """
+        Fetch OANDA order-book snapshot for an instrument.
+
+        Returns a dict with:
+          long_pct   — % of open client positions that are long  (0–100)
+          short_pct  — % of open client positions that are short (0–100)
+          bias       — "long_crowded" | "short_crowded" | "neutral"
+          contrarian — suggested contrarian direction ("SELL" | "BUY" | "HOLD")
+
+        Interpretation (contra-indicator): when ≥70% of retail is long, the
+        "dumb money" is max-long and institutional flow is usually the other way.
+        Use to BLOCK trades that align with extreme retail positioning.
+
+        Returns empty dict on any error (non-fatal — caller must handle gracefully).
+        """
+        try:
+            import oandapyV20.endpoints.instruments as _instruments
+            params = {"period": str(3600)}   # 1-hour snapshot
+            req = _instruments.InstrumentsOrderBook(instrument, params=params)
+            data = await asyncio.to_thread(self._client.request, req)
+            buckets = data.get("orderBook", {}).get("buckets", [])
+            if not buckets:
+                return {}
+
+            long_units  = sum(float(b.get("longCountPercent",  0)) for b in buckets)
+            short_units = sum(float(b.get("shortCountPercent", 0)) for b in buckets)
+            total = long_units + short_units
+            if total <= 0:
+                return {}
+
+            long_pct  = round(long_units  / total * 100, 1)
+            short_pct = round(short_units / total * 100, 1)
+
+            CROWD_THRESHOLD = 70.0
+            if long_pct >= CROWD_THRESHOLD:
+                bias, contrarian = "long_crowded", "SELL"
+            elif short_pct >= CROWD_THRESHOLD:
+                bias, contrarian = "short_crowded", "BUY"
+            else:
+                bias, contrarian = "neutral", "HOLD"
+
+            return {
+                "long_pct":   long_pct,
+                "short_pct":  short_pct,
+                "bias":       bias,
+                "contrarian": contrarian,
+            }
+        except Exception as e:
+            log.debug(f"Retail sentiment fetch failed for {instrument}: {e}")
+            return {}
 
 
 # ── Singleton factory ─────────────────────────────────────────────────────────

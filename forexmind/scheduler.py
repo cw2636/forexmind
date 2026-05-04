@@ -283,9 +283,10 @@ async def _save_trade_to_db(signal_id: int | None, data: dict, trade_result: dic
         log.error(f"Failed to save trade to DB: {e}")
 
 
-async def _auto_place_trade(data: dict) -> tuple[bool, str, dict]:
+async def _auto_place_trade(data: dict, canary_mgr=None) -> tuple[bool, str, dict]:
     """
     Place a trade automatically using the risk manager for position sizing.
+    If canary_mgr is provided, log the trade outcome for A/B testing.
     Returns (success, message).
     """
     from forexmind.agents.tools import _place_trade
@@ -391,6 +392,21 @@ async def _auto_place_trade(data: dict) -> tuple[bool, str, dict]:
         result["actual_stop_loss"] = proposal.stop_loss
         result["actual_take_profit"] = take_profit
 
+        # Log trade to canary for A/B live testing (if enabled)
+        if canary_mgr:
+            try:
+                canary_mgr.log_trade(
+                    instrument=instrument,
+                    side=direction,
+                    entry_price=filled,
+                    expected_tp=take_profit,
+                    expected_sl=proposal.stop_loss,
+                    units=proposal.units,
+                    confidence=float(data.get("signal", {}).get("confidence", 0)) / 100.0,
+                )
+            except Exception as canary_err:
+                log.warning(f"Failed to log to canary: {canary_err}")
+
         msg = (
             f"Trade #{trade_id or '?'} | "
             f"Filled @ {filled} | "
@@ -402,7 +418,7 @@ async def _auto_place_trade(data: dict) -> tuple[bool, str, dict]:
         return False, str(e), {}
 
 
-async def _scan_pairs(bot, chat_id: str, recent_alerts: dict[str, AlertRecord]) -> None:
+async def _scan_pairs(bot, chat_id: str, recent_alerts: dict[str, AlertRecord], canary_mgr=None) -> None:
     """Scan all session-recommended pairs and fire alerts for qualifying signals."""
     from forexmind.agents.tools import _get_signal
     from forexmind.config.settings import get_settings
@@ -622,7 +638,7 @@ async def _scan_pairs(bot, chat_id: str, recent_alerts: dict[str, AlertRecord]) 
 
                 # HIGH CONFIDENCE — 3+ strategies agree, clean conditions — place trade automatically
                 log.info(f"{pair}: confidence {confidence}% >= {AUTO_TRADE_CONFIDENCE}% with {agreeing_count}/4 strategies — auto-trading")
-                success, trade_msg, trade_result = await _auto_place_trade(data)
+                success, trade_msg, trade_result = await _auto_place_trade(data, canary_mgr=canary_mgr)
 
                 if success:
                     await _save_trade_to_db(signal_id, data, trade_result)
@@ -1528,6 +1544,15 @@ async def run_scheduler() -> None:
     asyncio.create_task(_thesis_monitor_loop(bot, chat_id))
     log.info("Thesis monitor started (5-min interval)")
 
+    # Initialize canary manager for A/B live trading
+    try:
+        from forexmind.ab_test.canary import CanaryManager
+        canary_mgr = CanaryManager(data_dir='forexmind/data', sample_fraction=0.05)
+        log.info("Canary manager initialized (5% sample rate for A/B live routing)")
+    except Exception as _e:
+        log.warning(f"Canary manager init failed: {_e}")
+        canary_mgr = None
+
     recent_alerts: dict[str, AlertRecord] = {}
     session_open_announced = False
     last_retrain_date: datetime | None = None
@@ -1566,7 +1591,7 @@ async def run_scheduler() -> None:
                 )
                 session_open_announced = True
 
-            await _scan_pairs(bot, chat_id, recent_alerts)
+            await _scan_pairs(bot, chat_id, recent_alerts, canary_mgr=canary_mgr)
             log.info(f"Scan complete. Next scan in {SCAN_INTERVAL_MINUTES} minutes.")
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 

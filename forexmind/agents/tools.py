@@ -29,6 +29,18 @@ from typing import Optional
 _signal_cache: dict[str, tuple[str, float]] = {}  # key → (result_json, timestamp)
 _SIGNAL_CACHE_TTL = 20  # seconds — short enough that manual /signals feels fresh
 
+# ── Pending trade — set by propose_trade, consumed by confirm flow ─────────────
+_pending_trade: dict | None = None
+
+
+def get_pending_trade() -> dict | None:
+    return _pending_trade
+
+
+def clear_pending_trade() -> None:
+    global _pending_trade
+    _pending_trade = None
+
 try:
     from langchain_core.tools import StructuredTool
 except ImportError:
@@ -79,6 +91,14 @@ class PlaceTradeInput(BaseModel):
     units: int = Field(..., description="Number of units (1 lot = 100,000 units)")
     stop_loss: float = Field(..., description="Stop-loss price level")
     take_profit: float = Field(..., description="Take-profit price level")
+
+
+class ProposeTradeInput(BaseModel):
+    instrument: str = Field(..., description="Forex pair, e.g. EUR_USD")
+    direction: str = Field(..., description="BUY or SELL")
+    stop_loss: float = Field(..., description="Stop-loss price level")
+    take_profit: float = Field(..., description="Take-profit price level")
+    reasoning: str = Field("", description="Brief rationale for this trade")
 
 
 # ── Tool functions ─────────────────────────────────────────────────────────────
@@ -147,6 +167,28 @@ async def _get_signal(instrument: str, timeframe: str = "H1", candles: int = 300
         news = get_news_aggregator()
         sentiment = news.get_instrument_sentiment(instrument, lookback_hours=4)
 
+        # Retail positioning (contra-indicator)
+        retail_sentiment: dict = {}
+        try:
+            from forexmind.data.oanda_client import get_oanda_client as _get_oanda
+            retail_sentiment = await _get_oanda().get_retail_sentiment(instrument)
+        except Exception:
+            pass
+
+        # VWAP position for current bar — institutional price anchor
+        _above_vwap: int | None = None
+        _vwap_dist_atr: float | None = None
+        try:
+            from forexmind.strategy.feature_engineering import add_vwap_features as _add_vwap
+            _vwap_df = _add_vwap(df_ind.copy())
+            _last = _vwap_df.iloc[-1]
+            if "above_vwap" in _vwap_df.columns:
+                _above_vwap = int(_last["above_vwap"])
+            if "vwap_dist_atr" in _vwap_df.columns:
+                _vwap_dist_atr = round(float(_last["vwap_dist_atr"]), 3)
+        except Exception:
+            pass
+
         # Session status
         session = get_session_status()
 
@@ -195,8 +237,11 @@ async def _get_signal(instrument: str, timeframe: str = "H1", candles: int = 300
                 "stoch_cross": snap["stoch_cross"],
                 "bb_position": round(snap["bb_position"], 2),
                 "atr": round(snap["atr"], 5),
+                "atr_avg_20": round(float(df_ind["atr"].dropna().iloc[-20:].mean()), 5) if "atr" in df_ind.columns and len(df_ind) >= 20 else None,
                 "support": snap["support"],
                 "resistance": snap["resistance"],
+                "above_vwap": _above_vwap,
+                "vwap_dist_atr": _vwap_dist_atr,
             },
 
             # Context
@@ -207,7 +252,17 @@ async def _get_signal(instrument: str, timeframe: str = "H1", candles: int = 300
                 "score": session.session_score,
             },
             "news_sentiment": sentiment,
+            "retail_sentiment": retail_sentiment,
             "reasoning": sig.reasoning,
+
+            # Per-strategy direction votes — parsed from reasoning for scheduler filters
+            # e.g. {"rule_based": "SELL", "lgbm": "SELL", "lstm": "HOLD", "rl": "SELL"}
+            "strategy_votes": {
+                m.group(1): m.group(2)
+                for line in sig.reasoning.split("\n")
+                for m in [__import__("re").match(r"\s*\[(\w+)\]\s+(\w+)\s+conf=", line)]
+                if m
+            },
         }
         result_json = json.dumps(result, indent=2, default=str)
         _signal_cache[cache_key] = (result_json, time.monotonic())
@@ -346,6 +401,22 @@ async def _place_trade(
             take_profit=take_profit,
         )
 
+        # Persist the open trade to DB for durable stats tracking
+        if result.success and result.trade_id:
+            try:
+                from forexmind.data.trade_repo import open_trade as db_open_trade
+                await db_open_trade(
+                    oanda_trade_id=str(result.trade_id),
+                    instrument=instrument,
+                    direction=direction,
+                    units=abs(signed_units),
+                    entry_price=result.filled_price or 0.0,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                )
+            except Exception as db_err:
+                log.warning(f"DB open_trade failed (non-fatal): {db_err}")
+
         return json.dumps({
             "success": result.success,
             "trade_id": result.trade_id,
@@ -359,6 +430,84 @@ async def _place_trade(
         }, indent=2)
     except Exception as e:
         log.error(f"place_trade error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+async def _propose_trade(
+    instrument: str,
+    direction: str,
+    stop_loss: float,
+    take_profit: float,
+    reasoning: str = "",
+) -> str:
+    """
+    Propose a trade for user confirmation. Calculates position size via risk manager
+    but does NOT execute. Stores proposal so the UI can show a confirm button.
+    """
+    global _pending_trade
+    try:
+        from forexmind.data.oanda_client import get_oanda_client
+        from forexmind.risk.manager import get_risk_manager
+        from forexmind.utils.helpers import price_to_pips, pip_size
+
+        client = get_oanda_client()
+        acc = await client.get_account()
+        price = await client.get_price(instrument)
+        rm = get_risk_manager()
+
+        atr_fallback = abs(price.mid - stop_loss)
+        proposal = rm.calculate_risk(
+            instrument=instrument,
+            direction=direction,
+            entry=price.mid,
+            atr=atr_fallback,
+            account_balance=acc.balance,
+        )
+
+        if not proposal.approved:
+            return json.dumps({
+                "status": "rejected",
+                "reason": proposal.rejection_reason,
+            })
+
+        ps = pip_size(instrument)
+        stop_pips = round(price_to_pips(abs(price.mid - stop_loss), instrument), 1)
+        tp_pips = round(price_to_pips(abs(take_profit - price.mid), instrument), 1)
+        rr = round(tp_pips / stop_pips, 2) if stop_pips > 0 else 0
+
+        _pending_trade = {
+            "instrument": instrument,
+            "direction": direction,
+            "entry": price.mid,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "units": proposal.units,
+            "stop_pips": stop_pips,
+            "tp_pips": tp_pips,
+            "risk_pct": proposal.risk_pct,
+            "risk_usd": proposal.risk_usd,
+            "rr": rr,
+            "reasoning": reasoning,
+        }
+
+        return json.dumps({
+            "status": "awaiting_confirmation",
+            "instrument": instrument,
+            "direction": direction,
+            "entry": price.mid,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "units": proposal.units,
+            "stop_pips": stop_pips,
+            "tp_pips": tp_pips,
+            "risk_pct": proposal.risk_pct,
+            "risk_usd": round(proposal.risk_usd, 2),
+            "risk_reward": rr,
+            "message": "Trade proposal ready — awaiting user confirmation",
+        }, indent=2)
+
+    except Exception as e:
+        log.error(f"propose_trade error: {e}")
         return json.dumps({"error": str(e)})
 
 
@@ -418,6 +567,17 @@ def build_tools() -> list[StructuredTool]:
             name="place_trade",
             description=PLACE_TRADE_TOOL_DESCRIPTION,
             args_schema=PlaceTradeInput,
+        ),
+        StructuredTool.from_function(
+            coroutine=_propose_trade,
+            name="propose_trade",
+            description=(
+                "Propose a trade for user confirmation. Use this when the user says 'trade X', "
+                "'buy X', 'sell X', or asks you to place a trade. "
+                "This calculates position size and stores the proposal — the UI will show a "
+                "confirm button. Do NOT call place_trade directly from chat; always use this first."
+            ),
+            args_schema=ProposeTradeInput,
         ),
         StructuredTool.from_function(
             func=_get_sessions,

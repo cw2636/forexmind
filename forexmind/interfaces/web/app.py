@@ -54,6 +54,16 @@ class ChatResponse(BaseModel):
     timestamp: str
 
 
+class TradeRequest(BaseModel):
+    instrument: str
+    direction: str          # "BUY" or "SELL"
+    entry: float
+    stop_loss: float
+    take_profit: float
+    atr: float = 0.0005
+    confidence: float = 0.70
+
+
 # ── WebSocket connection manager ──────────────────────────────────────────────
 
 class ConnectionManager:
@@ -107,7 +117,7 @@ async def _signal_broadcast_loop() -> None:
             continue
 
         session = get_session_status()
-        if session.is_weekend or session.session_score < 0.2:
+        if session.is_weekend or session.session_score < 0.4:
             continue
 
         try:
@@ -116,7 +126,7 @@ async def _signal_broadcast_loop() -> None:
             from forexmind.utils.session_times import best_pairs_for_session
             pairs = best_pairs_for_session()[:3]
             for pair in pairs:
-                result = await _get_signal(pair, "M5", 200)
+                result = await _get_signal(pair, "M15", 200)
                 payload = {"type": "signal", "data": json.loads(result), "timestamp": datetime.now(timezone.utc).isoformat()}
                 await ws_manager.broadcast(json.dumps(payload))
                 await asyncio.sleep(2)   # Stagger broadcasts
@@ -131,6 +141,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup and shutdown tasks for the FastAPI application."""
     log.info("ForexMind Web Server starting...")
     await init_db()
+
+    # Restore win/loss counters from DB so stats survive restarts
+    from forexmind.risk.manager import get_risk_manager
+    await get_risk_manager().load_stats_from_db()
 
     # Start periodic signal broadcast in background
     broadcast_task = asyncio.create_task(_signal_broadcast_loop())
@@ -181,9 +195,31 @@ async def sessions():
     }
 
 
+@app.get("/api/stats")
+async def get_stats():
+    """Get all-time trade performance stats from the database."""
+    from forexmind.data.trade_repo import get_stats as db_get_stats
+    return await db_get_stats()
+
+
+def _low_liquidity_response(score: float) -> dict:
+    return {
+        "low_liquidity": True,
+        "session_score": score,
+        "message": (
+            f"Liquidity {score:.0%} — signals unavailable below 40%. "
+            "Wait for an active session (Tokyo 00:00–09:00 UTC, "
+            "London 07:00–16:00 UTC, New York 12:00–21:00 UTC)."
+        ),
+    }
+
+
 @app.get("/api/signal/{instrument}")
 async def get_signal(instrument: str, timeframe: str = "M5"):
     """Get trading signal for a specific instrument."""
+    session = get_session_status()
+    if session.session_score < 0.4:
+        return JSONResponse(status_code=200, content=_low_liquidity_response(session.session_score))
     instrument = instrument.upper().replace("/", "_").replace("-", "_")
     try:
         from forexmind.agents.tools import _get_signal
@@ -197,6 +233,10 @@ async def get_signal(instrument: str, timeframe: str = "M5"):
 async def get_all_signals(timeframe: str = "H1", refresh: bool = False):
     """Get signals for all recommended pairs — H1 primary + M15 entry confirmation."""
     global _signals_cache, _signals_cache_time
+
+    session = get_session_status()
+    if session.session_score < 0.4:
+        return JSONResponse(status_code=200, content=_low_liquidity_response(session.session_score))
 
     # Serve from cache if fresh and not explicitly bypassed
     if not refresh and _signals_cache and (time.monotonic() - _signals_cache_time) < SIGNALS_CACHE_TTL:
@@ -256,6 +296,34 @@ async def get_account():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/trades")
+async def get_open_trades():
+    """Get all currently open trades from OANDA."""
+    try:
+        from forexmind.data.oanda_client import get_oanda_client
+        client = get_oanda_client()
+        trades = await client.get_open_trades()
+        return {"trades": trades, "count": len(trades)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/trades/{trade_id}/close")
+async def close_trade_api(trade_id: str):
+    """Close an open trade by OANDA trade ID."""
+    try:
+        from forexmind.data.oanda_client import get_oanda_client
+        client = get_oanda_client()
+        result = await client.close_trade(trade_id)
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "realized_pnl": result.realized_pl if hasattr(result, "realized_pl") else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/news/{instrument}")
 async def get_news(instrument: str, lookback_hours: int = 4):
     instrument = instrument.upper().replace("/", "_")
@@ -301,6 +369,96 @@ async def chat_stream(request: ChatRequest):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@app.post("/api/trade")
+async def place_trade_api(request: TradeRequest):
+    """Place a trade from the web dashboard using the risk manager for position sizing."""
+    session = get_session_status()
+    if session.session_score < 0.4:
+        return JSONResponse(status_code=400, content=_low_liquidity_response(session.session_score))
+
+    instrument = request.instrument.upper().replace("/", "_").replace("-", "_")
+    direction = request.direction.upper()
+    if direction not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="direction must be BUY or SELL")
+    try:
+        from forexmind.agents.tools import _place_trade
+        from forexmind.data.oanda_client import get_oanda_client
+        from forexmind.risk.manager import get_risk_manager
+
+        client = get_oanda_client()
+        acc = await client.get_account()
+        rm = get_risk_manager()
+        rm.update_peak(acc.balance)
+
+        proposal = rm.calculate_risk(
+            instrument=instrument,
+            direction=direction,
+            entry=request.entry,
+            atr=request.atr,
+            account_balance=acc.balance,
+            confidence=request.confidence,
+        )
+        if not proposal.approved:
+            return JSONResponse(status_code=400, content={"error": proposal.rejection_reason})
+
+        result_str = await _place_trade(
+            instrument=instrument,
+            direction=direction,
+            units=proposal.units,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+        )
+        result = json.loads(result_str)
+        log.info(f"_place_trade raw result: {result}")
+        if "error" in result:
+            return JSONResponse(status_code=400, content=result)
+
+        trade_id = result.get("trade_id") or "—"
+        # Use filled_price from result; fall back to request entry if 0 or missing
+        filled_raw = result.get("filled_price", 0)
+        filled = float(filled_raw) if filled_raw else request.entry
+        filled_fmt = f"{filled:.5f}" if filled else str(request.entry)
+
+        log.info(f"Web trade placed: {direction} {instrument} id={trade_id} filled={filled_fmt} units={proposal.units}")
+
+        # Notify Telegram so web-placed trades appear alongside auto-trades
+        try:
+            from forexmind.config.settings import get_settings
+            from telegram import Bot
+            from telegram.constants import ParseMode
+            cfg = get_settings()
+            if cfg.telegram.is_configured:
+                emoji = "🟢" if direction == "BUY" else "🔴"
+                msg = (
+                    f"{emoji} <b>WEB TRADE: {direction} {instrument.replace('_','/')}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Trade ID:    <code>{trade_id}</code>\n"
+                    f"Filled @     <code>{filled_fmt}</code>\n"
+                    f"Stop Loss:   <code>{request.stop_loss:.5f}</code>\n"
+                    f"Take Profit: <code>{request.take_profit:.5f}</code>\n"
+                    f"Units:       {proposal.units:,}\n"
+                    f"Risk:        <b>{proposal.risk_pct:.1f}%</b>\n"
+                    f"R:R:         2.0:1\n"
+                    f"\n<i>Placed via web dashboard</i>"
+                )
+                bot = Bot(token=cfg.telegram.bot_token)
+                await bot.send_message(chat_id=cfg.telegram.chat_id, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as tg_err:
+            log.warning(f"Telegram notify failed for web trade: {tg_err}")
+
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "filled_price": filled,
+            "units": proposal.units,
+            "risk_pct": proposal.risk_pct,
+            "instrument": instrument,
+            "direction": direction,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.websocket("/ws/signals")
 async def websocket_signals(websocket: WebSocket):
     """
@@ -310,13 +468,21 @@ async def websocket_signals(websocket: WebSocket):
     await ws_manager.connect(websocket)
     # Send initial session status immediately on connect
     session = get_session_status()
-    await websocket.send_text(json.dumps({
+    init_payload: dict = {
         "type": "session",
         "data": {
             "active_sessions": session.active_sessions,
             "is_overlap": session.is_overlap,
-        }
-    }))
+            "session_score": session.session_score,
+            "low_liquidity": session.session_score < 0.4,
+        },
+    }
+    if session.session_score < 0.4:
+        init_payload["data"]["message"] = (
+            f"Liquidity {session.session_score:.0%} — signals paused. "
+            "Returns when an active session opens."
+        )
+    await websocket.send_text(json.dumps(init_payload))
     try:
         while True:
             # Keep connection alive by reading (client can send pings)

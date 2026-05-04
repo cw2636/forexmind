@@ -343,6 +343,148 @@ def add_target_label(
     return df
 
 
+def add_rr_target_label(
+    df: pd.DataFrame,
+    atr_mult: float = 1.5,
+    rr_ratio: float = 2.0,
+    max_forward_bars: int = 100,
+) -> pd.DataFrame:
+    """
+    2R-hit target: directly optimises for the actual 2:1 R:R we trade.
+
+    For each bar i (entry = close[i]):
+      SL distance = ATR[i] × atr_mult
+      BUY TP      = entry + SL_dist × rr_ratio  (upside target)
+      BUY SL      = entry - SL_dist             (downside invalidation)
+
+    Scan forward bar-by-bar:
+      • high[j] ≥ BUY_TP first  → label = +1  (BUY wins)
+      • low[j]  ≤ BUY_SL first  → label = -1  (SELL wins / BUY would lose)
+      • Both same bar            → skip (ambiguous fill)
+      • Neither within max_bars  → NaN (filtered out at training time)
+
+    This is strictly better than a fixed N-bar return target because:
+      1. No arbitrary time horizon — waits until the trade resolves
+      2. Directly represents 2:1 R:R profitability, not just price direction
+      3. Immune to noise inside the SL/TP band
+      4. Symmetric: label=+1 means SELL would lose; label=-1 means BUY would lose
+    """
+    close = df["close"].values.astype(np.float64)
+    high  = df["high"].values.astype(np.float64)
+    low   = df["low"].values.astype(np.float64)
+    atr   = (
+        df["atr"].values.astype(np.float64)
+        if "atr" in df.columns
+        else close * 0.001
+    )
+
+    N = len(df)
+    targets = np.full(N, np.nan)
+
+    for i in range(N - 1):
+        sl_dist = max(atr[i] * atr_mult, close[i] * 0.0003)   # floor: 3 pips on 1.0
+        tp_long = close[i] + sl_dist * rr_ratio
+        sl_long = close[i] - sl_dist
+
+        end = min(i + max_forward_bars + 1, N)
+        for j in range(i + 1, end):
+            hit_tp = high[j] >= tp_long
+            hit_sl = low[j]  <= sl_long
+            if hit_tp and hit_sl:
+                break          # ambiguous bar — skip
+            elif hit_tp:
+                targets[i] = 1
+                break
+            elif hit_sl:
+                targets[i] = -1
+                break
+
+    df["target"] = targets
+    return df
+
+
+def add_vwap_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add intraday VWAP and distance features.
+
+    VWAP resets at each UTC calendar day and is computed from tick-volume-
+    weighted typical price — the same anchor institutional algorithms use.
+
+    Features added:
+      vwap             — cumulative VWAP price for the day
+      vwap_dist        — close - VWAP (positive = price above VWAP)
+      vwap_dist_atr    — vwap_dist normalised by ATR (scale-invariant)
+      above_vwap       — binary flag (1 = price > VWAP, bullish bias)
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    df = df.copy()
+    vol = df["volume"].replace(0, 1)                    # avoid divide-by-zero
+    tp  = (df["high"] + df["low"] + df["close"]) / 3   # typical price
+
+    date_key = df.index.normalize()                      # UTC day boundary
+    df["_tpvol"] = tp * vol
+    df["_cumtpvol"] = df.groupby(date_key)["_tpvol"].cumsum()
+    df["_cumvol"]   = df.groupby(date_key)[vol.name if hasattr(vol, "name") else "volume"].cumsum()
+    df["_cumvol"]   = df.groupby(date_key)["volume"].transform("cumsum")
+    df["vwap"]      = df["_cumtpvol"] / df["_cumvol"].replace(0, np.nan)
+
+    df["vwap_dist"] = df["close"] - df["vwap"]
+    if "atr" in df.columns:
+        df["vwap_dist_atr"] = df["vwap_dist"] / df["atr"].replace(0, np.nan)
+    else:
+        df["vwap_dist_atr"] = 0.0
+    df["above_vwap"] = (df["close"] > df["vwap"]).astype(np.int8)
+
+    df.drop(columns=["_tpvol", "_cumtpvol", "_cumvol"], inplace=True, errors="ignore")
+    return df
+
+
+def add_prev_day_levels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add previous-day OHLC as support/resistance features.
+
+    Institutional traders heavily reference the previous day's high, low,
+    and close as decision points. Distance from these levels is a strong
+    predictor of short-term reversals and breakouts.
+
+    Features added:
+      prev_day_high / prev_day_low / prev_day_close
+      dist_prev_high / dist_prev_low — normalised by ATR
+      inside_prev_day_range          — 1 if price is consolidating inside yesterday
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    df = df.copy()
+    daily = df["close"].resample("1D").ohlc()
+    daily.columns = ["d_open", "d_high", "d_low", "d_close"]
+    daily["d_high_prev"]  = daily["d_high"].shift(1)
+    daily["d_low_prev"]   = daily["d_low"].shift(1)
+    daily["d_close_prev"] = daily["d_close"].shift(1)
+
+    # Forward-fill daily levels onto the intraday index
+    df = df.join(daily[["d_high_prev", "d_low_prev", "d_close_prev"]], how="left")
+    df[["d_high_prev", "d_low_prev", "d_close_prev"]] = (
+        df[["d_high_prev", "d_low_prev", "d_close_prev"]].ffill()
+    )
+
+    atr_ref = df["atr"].replace(0, np.nan) if "atr" in df.columns else df["close"] * 0.001
+    df["dist_prev_high"] = (df["close"] - df["d_high_prev"]) / atr_ref
+    df["dist_prev_low"]  = (df["close"] - df["d_low_prev"])  / atr_ref
+    df["inside_prev_day_range"] = (
+        (df["close"] < df["d_high_prev"]) & (df["close"] > df["d_low_prev"])
+    ).astype(np.int8)
+
+    df.rename(columns={
+        "d_high_prev":  "prev_day_high",
+        "d_low_prev":   "prev_day_low",
+        "d_close_prev": "prev_day_close",
+    }, inplace=True)
+    return df
+
+
 # ── Pipeline orchestrator ─────────────────────────────────────────────────────
 
 def build_feature_matrix(
@@ -351,6 +493,7 @@ def build_feature_matrix(
     lags: int = 5,
     include_sessions: bool = True,
     forward_bars: int = 12,
+    use_rr_target: bool = True,
 ) -> pd.DataFrame:
     """
     Apply the full feature engineering pipeline to a DataFrame.
@@ -360,7 +503,10 @@ def build_feature_matrix(
         add_target: Whether to add the target label column (for training)
         lags: Number of lag features per indicator
         include_sessions: Whether to add Forex session flags
-        forward_bars: Number of bars ahead the target looks (used to trim NaN tail)
+        forward_bars: Number of bars ahead the legacy target looks (ignored when use_rr_target=True)
+        use_rr_target: If True (default), use the 2R-hit target instead of the legacy
+                       fixed-horizon return target. The 2R target directly optimises for
+                       trade profitability at 2:1 R:R — strongly preferred for live trading.
 
     Returns:
         Feature-rich DataFrame ready for ML training/inference.
@@ -373,11 +519,16 @@ def build_feature_matrix(
         add_time_features,
         add_htf_trend_features,
         add_volatility_regime,
+        add_vwap_features,
+        add_prev_day_levels,
     ]
     if include_sessions:
         transforms.append(add_session_flags)
     if add_target:
-        transforms.append(lambda d: add_target_label(d, forward_bars=forward_bars))
+        if use_rr_target:
+            transforms.append(add_rr_target_label)
+        else:
+            transforms.append(lambda d: add_target_label(d, forward_bars=forward_bars))
 
     # Apply all transforms in sequence using functools.reduce
     result = reduce(lambda d, fn: fn(d), transforms, df.copy())
@@ -386,8 +537,8 @@ def build_feature_matrix(
     initial_len = len(result)
     dropna_cols = ["rsi", "macd", "adx"]
     if add_target:
-        # Also drop rows where target is NaN — these are the final `forward_bars`
-        # rows whose future outcome is unknown. Assigning them label 0 would corrupt training.
+        # Also drop rows where target is NaN — these are the final rows
+        # whose future outcome is unknown. Assigning them a label would corrupt training.
         dropna_cols.append("target")
     result = result.dropna(subset=dropna_cols).copy()
     log.debug(f"Feature engineering: {initial_len} → {len(result)} rows after dropna")
@@ -403,6 +554,8 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     exclude = {
         # Raw OHLCV
         "open", "high", "low", "close", "volume",
+        # Multi-pair training metadata — string column, not a numeric feature
+        "instrument",
         # Target and auxiliary labels
         "target", "future_return",
         # Raw price-level pivot columns (not normalised)

@@ -235,7 +235,7 @@ class ForexMindAgent:
         5. Return final text response
         """
         for _ in range(max_iterations):
-            response = await self._llm_with_tools.ainvoke(messages)
+            response = await self._invoke_with_retry(messages)
             messages.append(response)
 
             # If no tool calls → we have the final answer
@@ -256,7 +256,7 @@ class ForexMindAgent:
                 )
 
         # Fallback: force a final answer if max iterations reached
-        final = await self._llm.ainvoke(messages)
+        final = await self._invoke_with_retry(messages, use_tools=False)
         return _extract_text_content(final.content)
 
     async def _resolve_tool_calls(
@@ -268,7 +268,7 @@ class ForexMindAgent:
         Used by stream_chat so we can stream the last response.
         """
         for _ in range(max_iterations):
-            response = await self._llm_with_tools.ainvoke(messages)
+            response = await self._invoke_with_retry(messages)
             messages.append(response)
 
             if not getattr(response, "tool_calls", None):
@@ -289,6 +289,34 @@ class ForexMindAgent:
                 )
 
         return messages
+
+    async def _invoke_with_retry(
+        self,
+        messages: list[BaseMessage],
+        use_tools: bool = True,
+        max_retries: int = 2,
+    ) -> Any:
+        """
+        Invoke the LLM with a single retry on transient serialisation errors.
+
+        langchain_anthropic occasionally fails to cast the raw Anthropic API
+        response into a Pydantic model (AttributeError: 'str' object has no
+        attribute 'model_dump'). One retry is enough to clear these transient
+        failures.
+        """
+        llm = self._llm_with_tools if use_tools else self._llm
+        last_err: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                return await llm.ainvoke(messages)
+            except AttributeError as e:
+                if "model_dump" in str(e):
+                    last_err = e
+                    log.warning(f"LLM invoke attempt {attempt + 1} failed ({e}) — retrying")
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                else:
+                    raise
+        raise last_err  # type: ignore[misc]
 
     async def _execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> str:
         """Execute a single tool by name, returning its string result."""

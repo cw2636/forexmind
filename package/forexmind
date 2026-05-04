@@ -1,0 +1,3 @@
+#!/bin/bash
+# /usr/bin/forexmind — wrapper script for the installed package
+exec /opt/forexmind/venv/bin/python -m forexmind.main "$@"

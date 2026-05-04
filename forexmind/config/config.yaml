@@ -6,22 +6,24 @@
 # ── Trading Pairs ─────────────────────────────────────────────────────────────
 # OANDA instrument format: BASE_QUOTE  (e.g. EUR_USD, not EUR/USD)
 pairs:
-  # Top 6 majors only — tightest spreads (0.1–1.5 pips), highest liquidity,
-  # ML models were trained on these. Exotics/minors removed: wide spreads eat
-  # ATR stops before price even moves.
-  - EUR_USD
+  # Priority order matters — first pair scanned first each cycle.
+  # GBP_USD leads: highest intraday pip range (~100 pips/day) among majors.
+  # EUR_USD second: tightest spread (0.1–0.3 pips), second-highest volume.
+  # USD_JPY third: excellent during Tokyo overlap.
+  # USD_CAD / AUD_USD: reliable mid-session trend pairs.
+  # USD_CHF removed — least ATR movement, slowest compounder.
   - GBP_USD
+  - EUR_USD
   - USD_JPY
-  - USD_CHF
   - USD_CAD
   - AUD_USD
+  # XAU_USD removed — OANDA practice account: INSTRUMENT_NOT_TRADEABLE
 
 # ── Timeframes ───────────────────────────────────────────────────────────────
-# Primary scalping timeframes + context timeframes
 timeframes:
-  primary: ["H1", "M15"]      # H1 primary: cleaner signals, wider stops beat spread easily
-  context: ["H4", "D"]        # H4/Daily for trend confirmation
-  swing: ["D", "W"]           # Daily/Weekly swing context
+  primary: ["M15"]             # M15 primary: best balance of signal quality + frequency
+  context: ["H1", "H4"]       # H1 for trend direction, H4 for swing context
+  swing: ["D", "W"]           # Daily/Weekly for bias
 
 # ── Indicator Settings ───────────────────────────────────────────────────────
 indicators:
@@ -46,25 +48,27 @@ indicators:
 # ── Signal Scoring Weights ───────────────────────────────────────────────────
 # How much each strategy type contributes to the final ensemble score (must sum to 1.0)
 ensemble_weights:
-  # RL agent weight cut to 0.05 — it defaults to HOLD 80%+ of the time,
-  # silently draining BUY/SELL confidence. Its 20% weight was the #1 cause
-  # of weak signals. Redistributed to rule_based + ML.
+  # RL agent re-enabled — ppo_forex.zip confirmed trained and present.
+  # Starts at 0.10 weight; live precision recalibration will grow/shrink it over time.
   rule_based: 0.35
-  lightgbm: 0.35
+  lightgbm: 0.30
   lstm: 0.25
-  rl_agent: 0.05
+  rl_agent: 0.10
 
 # ── Risk Management Defaults ─────────────────────────────────────────────────
 risk:
-  max_risk_per_trade_pct: 2.0      # Maximum account % risked per trade
-  min_risk_per_trade_pct: 0.5      # Minimum (even tiny confidence gets some)
+  max_risk_per_trade_pct: 5.0      # Confidence-tiered: 2%/3%/4%/5% — see helpers.confidence_scaled_risk()
+  min_risk_per_trade_pct: 2.0      # Floor: even lowest-confidence qualifying trade risks 2%
   default_rr_ratio: 2.0            # Minimum reward:risk ratio
-  atr_stop_multiplier: 2.0         # H1 ATR is bigger — 2.0x gives stop room above spread
+  atr_stop_multiplier: 1.5         # M15 ATR — 1.5x keeps stops tight enough to be sized up
   trailing_stop_multiplier: 1.0    # Trailing stop = current price ± (ATR × multiplier)
   breakeven_trigger_rr: 1.0        # Move SL to breakeven after 1R profit
-  max_concurrent_trades: 5         # Across ALL pairs simultaneously
-  max_daily_loss_pct: 5.0          # Kill switch: stop trading if daily drawdown hits this
+  max_concurrent_trades: 3         # Cap at 3 simultaneous trades — focus beats diversification
   spread_filter_pips: 3.0          # Skip trade if spread > this value in pips
+  daily_profit_target_pct: 2.0     # Daily stretch goal — lock in gains if +2% hit (protects exceptional days)
+  daily_loss_limit_pct: 5.0        # Hard stop: no new trades if daily loss exceeds 5%
+  max_total_drawdown_pct: 20.0     # Circuit breaker: halt all trading if equity drops 20% from peak
+  min_signal_confidence: 0.55      # Gate: reject signals below 55% — ensemble minimum
 
 # ── Session Times (UTC) ──────────────────────────────────────────────────────
 sessions:
@@ -90,7 +94,7 @@ ml:
   lookback_bars: 60                # How many candles of history per training sample
   train_test_split: 0.8
   cv_folds: 5
-  min_confidence_threshold: 0.58  # Slightly raised — H1 ML signals are cleaner
+  min_confidence_threshold: 0.62  # Matches MIN_ENSEMBLE_CONFIDENCE — 3-strategy agreement required
   retrain_interval_hours: 24      # Retrain models daily
 
 # ── News & Sentiment ─────────────────────────────────────────────────────────

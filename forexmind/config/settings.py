@@ -32,7 +32,10 @@ SYSTEM_CONFIG = Path("/etc/forexmind")
 SYSTEM_DATA = Path("/var/lib/forexmind")
 
 # Prefer /etc/forexmind/.env (installed package) over project-root .env (dev)
-ENV_FILE = SYSTEM_CONFIG / ".env" if SYSTEM_CONFIG.exists() else PROJECT_DIR / ".env"
+# Check for the actual .env file, not just the directory — avoids false positive when
+# /etc/forexmind/ exists but hasn't been configured yet (e.g. fresh .deb install)
+_system_env = SYSTEM_CONFIG / ".env"
+ENV_FILE = _system_env if _system_env.is_file() else PROJECT_DIR / ".env"
 
 # Load .env at module import time — safe to call multiple times
 load_dotenv(ENV_FILE, override=False)
@@ -117,16 +120,47 @@ class TelegramConfig:
 
 @dataclass
 class RiskConfig:
-    """Default risk management parameters (can be overridden by Claude per trade)."""
-    max_risk_per_trade_pct: float = 2.0
-    min_risk_per_trade_pct: float = 0.5
+    """
+    Risk parameters tuned for aggressive compounding on a small account.
+
+    Confidence-tiered sizing (set in risk/manager.py):
+      < 0.55  → skip trade entirely
+      0.55–0.65 → 2% risk  (marginal signal)
+      0.65–0.75 → 3% risk  (moderate conviction)
+      0.75–0.85 → 4% risk  (strong conviction)
+      > 0.85  → 5% risk  (highest conviction)
+
+    Circuit breakers:
+      daily_loss_limit_pct   — reset each day (prevents a bad session compounding)
+      max_total_drawdown_pct — measured from peak equity (prevents slow account bleed)
+    """
+    # Confidence-tier risk bounds (used by tiered sizing logic)
+    max_risk_per_trade_pct: float = 5.0       # top tier (conf > 0.85)
+    min_risk_per_trade_pct: float = 2.0       # bottom tradeable tier (conf 0.55–0.65)
     default_rr_ratio: float = 2.0
     atr_stop_multiplier: float = 1.5
     trailing_stop_multiplier: float = 1.0
     breakeven_trigger_rr: float = 1.0
-    max_concurrent_trades: int = 5
-    max_daily_loss_pct: float = 5.0
+    max_concurrent_trades: int = 3            # fewer, higher-quality positions only
     spread_filter_pips: float = 3.0
+
+    # Daily loss limit — hard stop for the day
+    daily_loss_limit_pct: float = 5.0         # halt if day loss exceeds 5% of balance
+
+    # Daily profit target — meaningful stretch goal for progress tracking
+    daily_profit_target_pct: float = 2.0      # ~$2,040 on $102k — locks in gains on exceptional days
+
+    # Total drawdown halt — measured from peak account equity
+    max_total_drawdown_pct: float = 20.0      # halt and alert if account drops 20% from peak
+
+    # Minimum confidence to place any trade at all
+    min_signal_confidence: float = 0.55
+
+    # ATR-based dynamic TP (Fix 1)
+    # TP = max(ATR * atr_tp_multiplier, SL_distance * min_rr_floor)
+    # This decouples TP sizing from the fixed RR ratio — TP now tracks volatility.
+    atr_tp_multiplier: float = 1.2   # tune between 0.8 and 2.0
+    min_rr_floor: float = 1.0        # never place a trade with RR below 1:1
 
 
 @dataclass

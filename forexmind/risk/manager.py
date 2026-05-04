@@ -28,11 +28,13 @@ from typing import Optional
 from forexmind.config.settings import get_settings, RiskConfig
 from forexmind.utils.helpers import (
     atr_stop_loss,
-    atr_take_profit,
+    confidence_scaled_risk,
     kelly_fraction,
+    pip_size,
     price_to_pips,
     units_from_risk,
 )
+from forexmind.utils.session_times import get_tp_session_multiplier
 from forexmind.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -124,6 +126,9 @@ class RiskManager:
         # Live win-rate tracking — feeds real data into Kelly sizing
         self._wins: int = 0
         self._losses: int = 0
+        # Peak equity tracking for total drawdown circuit breaker
+        self._peak_balance: float = 0.0     # highest account balance seen
+        self._initial_balance: float = 0.0  # set on first calculate_risk call
 
     def calculate_risk(
         self,
@@ -132,33 +137,73 @@ class RiskManager:
         entry: float,
         atr: float,
         account_balance: float,
+        confidence: float | None = None,       # Signal confidence (0–1) — drives tiered sizing
         ai_risk_pct: float | None = None,      # Optional override from Claude
-        atr_multiplier: float | None = None,    # Optional override
-        rr_ratio: float | None = None,          # Optional override
-        win_rate_estimate: float = 0.55,        # Used for Kelly Criterion
+        atr_multiplier: float | None = None,   # Optional override
+        rr_ratio: float | None = None,         # Optional override
+        win_rate_estimate: float = 0.55,       # Used for Kelly Criterion
+        skip_correlation: bool = False,        # Force bypass correlation block
     ) -> RiskProposal:
         """
         Calculate the complete risk proposal for a trade.
 
         Steps:
-          1. Check kill-switch (daily loss limit)
-          2. Check concurrent trade limit
-          3. Compute stop-loss and take-profit using ATR
-          4. Compute position size using risk %
-          5. Apply Kelly criterion as upper bound
-          6. Return RiskProposal for approval
+          1. Update peak equity; check total drawdown circuit breaker
+          2. Check daily loss limit
+          3. Confidence gate — reject if signal confidence is below minimum
+          4. Check concurrent trade limit
+          5. Compute stop-loss and take-profit using ATR
+          6. Compute position size using confidence-tiered risk %
+          7. Return RiskProposal for approval
         """
-        # ── Kill-switch checks ─────────────────────────────────────────────────
+        # ── Peak equity tracking ───────────────────────────────────────────────
+        if self._initial_balance == 0.0:
+            self._initial_balance = account_balance
+        if account_balance > self._peak_balance:
+            self._peak_balance = account_balance
+            log.info(f"New peak equity: ${self._peak_balance:.2f}")
+
+        # ── Total drawdown circuit breaker ─────────────────────────────────────
+        if self._peak_balance > 0:
+            drawdown_pct = (self._peak_balance - account_balance) / self._peak_balance * 100.0
+            if drawdown_pct >= self._cfg.max_total_drawdown_pct:
+                return _rejected(
+                    instrument, direction, entry, atr,
+                    f"🚨 TOTAL DRAWDOWN HALT: account is {drawdown_pct:.1f}% below peak "
+                    f"(${self._peak_balance:.2f} → ${account_balance:.2f}). "
+                    f"Review system before resuming trading."
+                )
+
+        # ── Daily loss limit ───────────────────────────────────────────────────
         today = datetime.now(timezone.utc).date().isoformat()
         if today != self._daily_pnl_date:
             self._daily_pnl_usd = 0.0
             self._daily_pnl_date = today
 
-        max_daily_loss = account_balance * self._cfg.max_daily_loss_pct / 100.0
-        if self._daily_pnl_usd < -max_daily_loss:
+        daily_loss_limit = account_balance * self._cfg.daily_loss_limit_pct / 100.0
+        if self._daily_pnl_usd <= -daily_loss_limit:
             return _rejected(
                 instrument, direction, entry, atr,
-                f"Daily loss limit hit (${self._daily_pnl_usd:.2f} loss, limit ${max_daily_loss:.2f})"
+                f"🛑 Daily loss limit hit: ${self._daily_pnl_usd:.2f} loss "
+                f"(limit ${daily_loss_limit:.2f}). No new trades today."
+            )
+
+        # Daily profit target — set very high so it only fires on extraordinary days
+        daily_profit_target = account_balance * self._cfg.daily_profit_target_pct / 100.0
+        if self._daily_pnl_usd >= daily_profit_target:
+            return _rejected(
+                instrument, direction, entry, atr,
+                f"🎯 Daily profit target reached: +${self._daily_pnl_usd:.2f} "
+                f"(target ${daily_profit_target:.2f}). Trading locked for today."
+            )
+
+        # ── Confidence gate ────────────────────────────────────────────────────
+        # Reject trades with insufficient signal confidence before sizing
+        if confidence is not None and confidence < self._cfg.min_signal_confidence:
+            return _rejected(
+                instrument, direction, entry, atr,
+                f"⚠️ Signal confidence {confidence:.0%} below minimum "
+                f"{self._cfg.min_signal_confidence:.0%} — skipping weak signal."
             )
 
         if len(self._open_trades) >= self._cfg.max_concurrent_trades:
@@ -167,29 +212,100 @@ class RiskManager:
                 f"Max concurrent trades ({self._cfg.max_concurrent_trades}) already open"
             )
 
+        # ── Correlated pair protection ─────────────────────────────────────────
+        # Trading two USD-base pairs in the same direction = double USD exposure.
+        # e.g. SELL USD/JPY + SELL USD/CAD = both profit only if USD weakens.
+        # One news event wipes both simultaneously.
+        if not skip_correlation:
+            _CORR_GROUPS: list[tuple[str, ...]] = [
+                ("USD_JPY", "USD_CAD", "USD_CHF"),   # USD as base — all correlate on USD strength
+                ("EUR_USD", "GBP_USD", "AUD_USD"),   # USD as quote — all correlate on USD weakness
+            ]
+            base, quote = (instrument.split("_") + [""])[:2]
+            for group in _CORR_GROUPS:
+                if instrument in group:
+                    # Check if we already have a trade in the same correlation group
+                    for _tid, open_trade in self._open_trades.items():
+                        open_inst = open_trade.instrument
+                        if open_inst in group and open_inst != instrument:
+                            # Same group — check if directions imply the same USD bet
+                            existing_dir = open_trade.direction
+                            same_bet = (direction == existing_dir)
+                            if same_bet:
+                                log.warning(
+                                    f"Correlated pair block: {instrument} {direction} correlates with "
+                                    f"existing {open_inst} {existing_dir}"
+                                )
+                                # Both groups are USD plays — determine which USD direction
+                                # Group (EUR/GBP/AUD)_USD: SELL = USD long, BUY = USD short
+                                # Group USD_(JPY/CAD/CHF): BUY  = USD long, SELL = USD short
+                                usd_quote_group = ("EUR_USD", "GBP_USD", "AUD_USD")
+                                usd_dir = (
+                                    "long" if (group == usd_quote_group and direction == "SELL")
+                                           or (group != usd_quote_group and direction == "BUY")
+                                    else "short"
+                                )
+                                return _rejected(
+                                    instrument, direction, entry, atr,
+                                    f"⚠️ Correlation block: already {existing_dir} {open_inst.replace('_','/')} "
+                                    f"— adding {direction} {instrument.replace('_','/')} doubles USD-{usd_dir} exposure"
+                                )
+
         # ── Stop-Loss & Take-Profit ────────────────────────────────────────────
         mult = atr_multiplier or self._cfg.atr_stop_multiplier
-        rr = rr_ratio or self._cfg.default_rr_ratio
 
         stop_loss = atr_stop_loss(entry, atr, direction, multiplier=mult)
-        take_profit = atr_take_profit(entry, stop_loss, direction, rr_ratio=rr)
+        sl_distance = abs(entry - stop_loss)
 
-        stop_pips = price_to_pips(abs(entry - stop_loss), instrument)
-        tp_pips = price_to_pips(abs(take_profit - entry), instrument)
+        # ATR-based dynamic TP: TP scales with volatility, not a fixed RR ratio.
+        # Floor ensures we never accept worse than min_rr_floor:1 RR.
+        atr_tp_distance = atr * self._cfg.atr_tp_multiplier
+        min_tp_distance = sl_distance * self._cfg.min_rr_floor
+        tp_distance = max(atr_tp_distance, min_tp_distance)
+
+        # Session-aware scaling (Fix 6): reduce TP during low-liquidity sessions
+        # so price is more likely to reach it before spread widens or momentum fades.
+        session_mult = get_tp_session_multiplier()
+        tp_distance = max(tp_distance * session_mult, min_tp_distance)
+
+        take_profit = entry + tp_distance if direction.upper() == "BUY" else entry - tp_distance
+
+        # RR used for Kelly / reward sizing — use actual achieved ratio
+        rr = tp_distance / sl_distance if sl_distance > 0 else (rr_ratio or self._cfg.default_rr_ratio)
+
+        stop_pips = price_to_pips(sl_distance, instrument)
+        tp_pips = price_to_pips(tp_distance, instrument)
+
+        log.info(
+            f"ATR-TP: atr={atr:.5f} * {self._cfg.atr_tp_multiplier} = {atr_tp_distance:.5f} | "
+            f"session_mult={session_mult:.2f} | final_tp_dist={tp_distance:.5f} | RR={rr:.2f}"
+        )
 
         # ── Position Sizing ────────────────────────────────────────────────────
-        # Use measured win rate if we have enough trades; fall back to estimate
         measured_wr = self.measured_win_rate
         effective_win_rate = measured_wr if measured_wr is not None else win_rate_estimate
         kelly = kelly_fraction(effective_win_rate, rr)
 
-        # Risk %: use AI override if provided, else Kelly-informed default
         if ai_risk_pct is not None:
+            # Claude override — honour it within hard bounds
             risk_pct = max(self._cfg.min_risk_per_trade_pct,
                            min(ai_risk_pct, self._cfg.max_risk_per_trade_pct))
+        elif confidence is not None:
+            # Confidence-tiered sizing — primary path
+            tiered = confidence_scaled_risk(confidence, self._cfg.min_signal_confidence)
+            if tiered == 0.0:
+                return _rejected(
+                    instrument, direction, entry, atr,
+                    f"⚠️ confidence_scaled_risk returned 0 for confidence={confidence:.2f}"
+                )
+            risk_pct = tiered
+            log.info(
+                f"Confidence-tiered sizing: conf={confidence:.2f} → risk={risk_pct:.1f}% "
+                f"(kelly={kelly:.3f}, kelly_pct={kelly*100:.1f}%)"
+            )
         else:
-            # Kelly suggests how much to risk; cap at our max
-            kelly_pct = kelly * 100.0  # Convert fraction to percentage
+            # No confidence provided — fall back to Kelly-informed sizing
+            kelly_pct = kelly * 100.0
             risk_pct = min(
                 max(kelly_pct, self._cfg.min_risk_per_trade_pct),
                 self._cfg.max_risk_per_trade_pct
@@ -208,10 +324,13 @@ class RiskManager:
 
         rr_actual = tp_pips / stop_pips if stop_pips > 0 else 0.0
 
+        conf_str = f"{confidence:.2f}" if confidence is not None else "n/a"
         log.info(
             f"Risk proposal: {direction} {instrument} "
-            f"risk={risk_pct:.2f}% kelly={kelly:.3f} "
-            f"sl={stop_pips:.1f}pips tp={tp_pips:.1f}pips R:R={rr_actual:.1f}"
+            f"conf={conf_str} "
+            f"risk={risk_pct:.2f}% (${risk_usd:.2f}) "
+            f"sl={stop_pips:.1f}pips tp={tp_pips:.1f}pips R:R={rr_actual:.1f} "
+            f"units={units:,}"
         )
 
         return RiskProposal(
@@ -230,6 +349,25 @@ class RiskManager:
             atr=atr,
             kelly_fraction=round(kelly, 4),
         )
+
+    def update_peak(self, account_balance: float) -> None:
+        """Update peak balance — call after every account balance fetch."""
+        if account_balance > self._peak_balance:
+            self._peak_balance = account_balance
+
+    @property
+    def total_drawdown_pct(self) -> float:
+        """Current drawdown from peak equity as a percentage."""
+        if self._peak_balance <= 0:
+            return 0.0
+        # NOTE: this is a snapshot using cached peak — call update_peak() first for accuracy
+        return (self._peak_balance - self._initial_balance) / self._peak_balance * 100.0
+
+    def current_drawdown_pct(self, account_balance: float) -> float:
+        """Live drawdown from peak using the current account balance."""
+        if self._peak_balance <= 0:
+            return 0.0
+        return max(0.0, (self._peak_balance - account_balance) / self._peak_balance * 100.0)
 
     async def register_trade(self, trade: OpenTrade) -> None:
         """Register an opened trade for tracking."""
@@ -311,13 +449,29 @@ class RiskManager:
                 self._wins += 1
             else:
                 self._losses += 1
+            wr = self.measured_win_rate
+            wr_str = f" | WR: {wr:.1%}" if wr is not None else ""
             log.info(
-                f"Trade closed: {trade_id} P&L = {pnl_pips:.1f} pips | "
-                f"Live W/L: {self._wins}/{self._losses} "
-                f"({self.measured_win_rate:.1%} WR)" if self.measured_win_rate else
-                f"Trade closed: {trade_id} P&L = {pnl_pips:.1f} pips"
+                f"Trade closed: {trade_id} P&L={pnl_pips:+.1f}pips | "
+                f"W/L: {self._wins}/{self._losses}{wr_str}"
             )
             return pnl_pips
+
+    async def sync_open_trades(self, oanda_open_ids: set[str]) -> None:
+        """
+        Reconcile _open_trades with OANDA's actual open trade IDs.
+        Removes any stale entries that OANDA no longer reports as open.
+        This prevents phantom trades from blocking correlation checks
+        and concurrent trade limits.
+        """
+        async with self._lock:
+            stale = [tid for tid in self._open_trades if tid not in oanda_open_ids]
+            for tid in stale:
+                trade = self._open_trades.pop(tid)
+                log.warning(
+                    f"Purged stale trade from risk manager: {tid} "
+                    f"{trade.instrument} {trade.direction} (no longer open on OANDA)"
+                )
 
     @property
     def open_trade_count(self) -> int:
@@ -329,9 +483,40 @@ class RiskManager:
 
     @property
     def is_kill_switch_active(self) -> bool:
-        return self._daily_pnl_usd < 0 and abs(self._daily_pnl_usd) >= (
-            10000 * self._cfg.max_daily_loss_pct / 100.0  # Rough check
-        )
+        ref_balance = self._peak_balance if self._peak_balance > 0 else 10_000.0
+        daily_loss_limit = ref_balance * self._cfg.daily_loss_limit_pct / 100.0
+        return self._daily_pnl_usd <= -daily_loss_limit
+
+    def daily_status(self, account_balance: float) -> dict:
+        """Return current daily P&L status relative to targets."""
+        profit_target = account_balance * self._cfg.daily_profit_target_pct / 100.0
+        loss_limit = account_balance * self._cfg.daily_loss_limit_pct / 100.0
+        pnl = self._daily_pnl_usd
+
+        if pnl >= profit_target:
+            status = "🎯 TARGET HIT — Trading locked"
+            locked = True
+        elif pnl <= -loss_limit:
+            status = "🛑 LOSS LIMIT HIT — Trading locked"
+            locked = True
+        elif pnl >= profit_target * 0.5:
+            status = "✅ On track — halfway to target"
+            locked = False
+        elif pnl <= -loss_limit * 0.5:
+            status = "⚠️ Caution — halfway to loss limit"
+            locked = False
+        else:
+            status = "🟢 Open — no limits hit"
+            locked = False
+
+        return {
+            "daily_pnl_usd": round(pnl, 2),
+            "profit_target_usd": round(profit_target, 2),
+            "loss_limit_usd": round(loss_limit, 2),
+            "progress_pct": round((pnl / profit_target * 100) if profit_target > 0 else 0, 1),
+            "status": status,
+            "trading_locked": locked,
+        }
 
     @property
     def measured_win_rate(self) -> float | None:
@@ -343,6 +528,42 @@ class RiskManager:
         if total < 30:
             return None
         return self._wins / total
+
+    def record_close(self, pnl_usd: float) -> None:
+        """
+        Update in-memory win/loss counters from a closed trade's USD P&L.
+        Always call this alongside close_trade_record() in trade_repo.
+        Break-even (pnl == 0) is excluded from both win and loss counters.
+        """
+        if pnl_usd > 0:
+            self._wins += 1
+            result = "WIN"
+        elif pnl_usd < 0:
+            self._losses += 1
+            result = "LOSS"
+        else:
+            result = "BREAKEVEN"   # not counted in either — doesn't distort win rate
+        self._daily_pnl_usd += pnl_usd
+        log.info(f"Trade recorded: {result} ${pnl_usd:+.2f} | W/L: {self._wins}/{self._losses}")
+
+    async def load_stats_from_db(self) -> None:
+        """
+        Load win/loss counters and today's P&L from the database.
+        Call once at application startup to restore state after restarts.
+        """
+        try:
+            from forexmind.data.trade_repo import get_stats
+            stats = await get_stats()
+            async with self._lock:
+                self._wins = stats["wins"]
+                self._losses = stats["losses"]
+                self._daily_pnl_usd = stats["today_pnl_usd"]
+            log.info(
+                f"Stats loaded from DB: {self._wins}W / {self._losses}L "
+                f"| today P&L: ${self._daily_pnl_usd:+.2f}"
+            )
+        except Exception as e:
+            log.error(f"load_stats_from_db error: {e}")
 
     @property
     def trade_stats(self) -> dict:

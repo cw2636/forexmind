@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "forexmind"
+version = "1.0.0"
+description = "AI-powered forex trading agent with ML ensemble"
+requires-python = ">=3.11"
+readme = "README.md"
+
+# Dependencies are intentionally omitted here — the .deb postinst installs
+# them into the bundled venv from requirements.txt, avoiding pip resolver
+# conflicts with heavy ML packages (torch, lightgbm, stable-baselines3).
+
+[project.scripts]
+forexmind = "forexmind.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forexmind*"]
+
+[tool.setuptools.package-data]
+forexmind = [
+    "config/config.yaml",
+    "interfaces/web/static/*",
+    "models/.gitkeep",
+]

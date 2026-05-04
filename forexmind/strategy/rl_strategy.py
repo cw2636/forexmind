@@ -21,6 +21,7 @@ Advanced Python:
 from __future__ import annotations
 
 import os
+import pickle
 from pathlib import Path
 from typing import Any, ClassVar, SupportsFloat
 
@@ -198,6 +199,7 @@ class RLStrategy(BaseStrategy):
 
     def __init__(self, model_path: Path | None = None) -> None:
         self._ppo: "PPO | None" = None
+        self._scaler: "StandardScaler | None" = None  # type: ignore[name-defined]
         self._feature_cols: list[str] = []
         self._window = 20
         self._cfg = get_settings()
@@ -217,6 +219,17 @@ class RLStrategy(BaseStrategy):
             meta_path = path.parent / "ppo_meta.npy"
             if meta_path.exists():
                 self._feature_cols = np.load(meta_path, allow_pickle=True).tolist()
+            # Load feature scaler — required for correct inference (training normalises features)
+            scaler_path = path.parent / "ppo_scaler.pkl"
+            if scaler_path.exists():
+                with open(scaler_path, "rb") as f:
+                    self._scaler = pickle.load(f)
+                log.info(f"PPO scaler loaded from {scaler_path}")
+            else:
+                log.warning(
+                    "ppo_scaler.pkl not found — RL inference will use raw features. "
+                    "Retrain the model to fix this."
+                )
             log.info(f"PPO model loaded from {path}")
         except Exception as e:
             log.error(f"Failed to load PPO model: {e}")
@@ -247,10 +260,11 @@ class RLStrategy(BaseStrategy):
         else:
             feat_df = build_feature_matrix(df, add_target=False)
         self._feature_cols = get_feature_columns(feat_df)
-        # Normalise features
+        # Normalise features and save scaler for consistent inference-time scaling
         from sklearn.preprocessing import StandardScaler
         scaler = StandardScaler()
         feat_df[self._feature_cols] = scaler.fit_transform(feat_df[self._feature_cols].values)
+        self._scaler = scaler
 
         env = DummyVecEnv([lambda: ForexTradingEnv(
             feat_df, self._feature_cols, window=self._window, instrument=instrument
@@ -273,6 +287,11 @@ class RLStrategy(BaseStrategy):
         model.learn(total_timesteps=total_timesteps)
         self._ppo = model
         self.save()
+        # Persist scaler alongside model so inference uses the same normalisation
+        scaler_path = (get_settings().app.models_dir / "ppo_scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+        log.info(f"PPO scaler saved to {scaler_path}")
         log.info("PPO training complete")
         return {"total_timesteps": total_timesteps}
 
@@ -290,8 +309,10 @@ class RLStrategy(BaseStrategy):
         if len(feat_df) < self._window:
             return self._hold_signal(instrument, timeframe, current_price, "Not enough data for RL window")
 
-        # Build observation vector
+        # Build observation vector — apply same StandardScaler used during training
         window_data = feat_df[self._feature_cols].iloc[-self._window:].values.astype(np.float32)
+        if self._scaler is not None:
+            window_data = self._scaler.transform(window_data).astype(np.float32)
         obs = window_data.flatten()
 
         action, _ = self._ppo.predict(obs, deterministic=True)
