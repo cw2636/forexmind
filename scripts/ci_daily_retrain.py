@@ -124,8 +124,22 @@ except Exception as e:
     print('LSTM failed:', e)
 
 # Write metrics json (named retrain_metrics.json for monitoring)
+# Convert numpy types to native Python types for JSON serialization
+import numpy as np
+def convert_to_serializable(obj):
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    return obj
+
+metrics_serializable = convert_to_serializable(metrics)
 with open(OUT_DIR / 'retrain_metrics.json', 'w') as fh:
-    json.dump(metrics, fh, indent=2)
+    json.dump(metrics_serializable, fh, indent=2)
 
 print('Artifacts saved to', OUT_DIR)
 
