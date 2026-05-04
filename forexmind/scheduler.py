@@ -1547,8 +1547,8 @@ async def run_scheduler() -> None:
     # Initialize canary manager for A/B live trading
     try:
         from forexmind.ab_test.canary import CanaryManager
-        canary_mgr = CanaryManager(data_dir='forexmind/data', sample_fraction=0.05)
-        log.info("Canary manager initialized (5% sample rate for A/B live routing)")
+        canary_mgr = CanaryManager(config={"models": {"control": 0.95, "variant": 0.05}})
+        log.info("Canary manager initialized (95/5 control/variant split for A/B live routing)")
     except Exception as _e:
         log.warning(f"Canary manager init failed: {_e}")
         canary_mgr = None
