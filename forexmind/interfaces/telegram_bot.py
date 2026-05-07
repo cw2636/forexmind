@@ -1171,6 +1171,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             acc = await client.get_account()
             rm = get_risk_manager()
             rm.update_peak(acc.balance)
+
+            # Reconcile cached open trades with live OANDA state before risk gating.
+            try:
+                open_trades = await client.get_open_trades()
+                await rm.sync_open_trades({str(t.get('id', '')) for t in open_trades if t.get('id')})
+            except Exception as sync_err:
+                log.warning(f"/trade sync skipped (non-fatal): {sync_err}")
+
             force_trade = context.user_data.pop("trade_force", False)
             proposal = rm.calculate_risk(
                 instrument=pair,

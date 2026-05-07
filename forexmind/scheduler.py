@@ -310,6 +310,13 @@ async def _auto_place_trade(data: dict, canary_mgr=None) -> tuple[bool, str, dic
         rm = get_risk_manager()
         rm.update_peak(acc.balance)   # keep peak equity current
 
+        # Reconcile cached open trades with live OANDA state before gating.
+        try:
+            oanda_open_trades = await client.get_open_trades()
+            await rm.sync_open_trades({str(t.get('id', '')) for t in oanda_open_trades if t.get('id')})
+        except Exception as sync_err:
+            log.warning(f"{instrument}: risk sync skipped (non-fatal): {sync_err}")
+
         proposal = rm.calculate_risk(
             instrument=instrument,
             direction=direction,
