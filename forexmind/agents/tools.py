@@ -394,6 +394,29 @@ async def _place_trade(
 
         client = get_oanda_client()
         signed_units = units if direction == "BUY" else -units
+        # Optional: consult prop guard before placing the order. The prop guard
+        # module may not be present in older checkouts; fail safe and continue
+        # when it's unavailable or errors occur.
+        guard = None
+        try:
+            from forexmind.risk.prop_guard import get_prop_guard
+            guard = get_prop_guard()
+        except Exception:
+            guard = None
+
+        if guard is not None:
+            try:
+                _check_res = guard.check(instrument=instrument, units=units, direction=direction)
+                if asyncio.iscoroutine(_check_res):
+                    _check_res = await _check_res
+                if not _check_res:
+                    return json.dumps({
+                        "warning": "Prop guard blocked the trade",
+                        "status": "blocked_by_guard"
+                    })
+            except Exception as guard_err:
+                log.warning(f"Prop guard check failed (non-fatal): {guard_err}")
+
         result = await client.market_order(
             instrument=instrument,
             units=signed_units,
@@ -414,6 +437,26 @@ async def _place_trade(
                     stop_loss=stop_loss,
                     take_profit=take_profit,
                 )
+                # Notify prop guard of the executed trade so it can update internal state
+                try:
+                    if guard is None:
+                        try:
+                            from forexmind.risk.prop_guard import get_prop_guard
+                            guard = get_prop_guard()
+                        except Exception:
+                            guard = None
+                    if guard is not None and hasattr(guard, "record_trade"):
+                        _rec = guard.record_trade(
+                            trade_id=str(result.trade_id),
+                            instrument=instrument,
+                            units=abs(signed_units),
+                            direction=direction,
+                            filled_price=result.filled_price or 0.0,
+                        )
+                        if asyncio.iscoroutine(_rec):
+                            await _rec
+                except Exception as guard_rec_err:
+                    log.warning(f"Prop guard record_trade failed (non-fatal): {guard_rec_err}")
             except Exception as db_err:
                 log.warning(f"DB open_trade failed (non-fatal): {db_err}")
 

@@ -1560,6 +1560,15 @@ async def run_scheduler() -> None:
         log.warning(f"Canary manager init failed: {_e}")
         canary_mgr = None
 
+    # Initialize prop guard (if available) so it is ready before any auto-trades
+    try:
+        from forexmind.risk.prop_guard import get_prop_guard
+        _prop_guard = get_prop_guard()
+        log.info("Prop guard initialized")
+    except Exception as _e:
+        _prop_guard = None
+        log.warning(f"Prop guard not available at startup: {_e}")
+
     recent_alerts: dict[str, AlertRecord] = {}
     session_open_announced = False
     last_retrain_date: datetime | None = None
